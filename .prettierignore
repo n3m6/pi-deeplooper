@@ -1,0 +1,5 @@
+node_modules/
+.pipeline/
+agents/
+docs/
+*.d.ts

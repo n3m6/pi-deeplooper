@@ -1,0 +1,23 @@
+{
+  "profile": "balanced",
+  "profiles": {
+    "balanced": {
+      "architect": { "model": "deepseek/deepseek-v4-pro", "thinking": "high" },
+      "coding":    { "model": "deepseek/deepseek-v4-pro", "thinking": "high" },
+      "review":    { "model": "deepseek/deepseek-v4-flash", "thinking": "medium" },
+      "utility":   { "model": "deepseek/deepseek-v4-flash", "thinking": "medium" }
+    },
+    "cheap": {
+      "architect": { "model": "deepseek/deepseek-v4-flash", "thinking": "medium" },
+      "coding":    { "model": "deepseek/deepseek-v4-flash", "thinking": "medium" },
+      "review":    { "model": "deepseek/deepseek-v4-flash", "thinking": "medium" },
+      "utility":   { "model": "deepseek/deepseek-v4-flash", "thinking": "medium" }
+    },
+    "max": {
+      "architect": { "model": "deepseek/deepseek-v4-pro", "thinking": "xhigh" },
+      "coding":    { "model": "deepseek/deepseek-v4-pro", "thinking": "xhigh" },
+      "review":    { "model": "deepseek/deepseek-v4-pro", "thinking": "high" },
+      "utility":   { "model": "deepseek/deepseek-v4-flash", "thinking": "high" }
+    }
+  }
+}

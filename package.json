@@ -1,0 +1,74 @@
+{
+  "name": "@n3m6/pi-deeplooper",
+  "version": "0.7.0",
+  "description": "Deterministic DEEPLOOPER pipeline extension for pi.",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/index.ts",
+  "files": [
+    "src",
+    "agents",
+    "docs",
+    "README.md",
+    "AGENTS.md",
+    "install.sh",
+    "uninstall.sh",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "deeplooper",
+    "vertical-slice"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/n3m6/pi-deeplooper.git"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --import tsx --test --test-concurrency=1 \"test/*.test.ts\" \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint --max-warnings=0 src/domain src/application src/infra test",
+    "format": "prettier --write src/ test/",
+    "format:check": "prettier --check src/ test/",
+    "verify": "npm run typecheck && npm run lint && npm run format:check && npm test",
+    "replay": "tsx scripts/replay.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.78.0",
+    "@earendil-works/pi-coding-agent": "0.78.0",
+    "@types/node": "25.9.1",
+    "eslint": "10.4.1",
+    "prettier": "3.8.3",
+    "tsx": "4.22.4",
+    "typebox": "1.1.39",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.60.1"
+  },
+  "packageManager": "npm@11.4.2"
+}

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "1",
+  "runId": "deeplooper-20260601-000000",
+  "route": "full",
+  "interactionMode": "automated",
+  "failurePolicy": "best-effort",
+  "userTask": "Implement a deterministic deeplooper pipeline.",
+  "reviewDepth": "thorough",
+  "lastCompletedStage": "report"
+}
