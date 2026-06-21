@@ -125,7 +125,16 @@ export const sliceLoopStage: StageModule = {
 
       // 1. dl-slice-planner — writes task specs.
       // (artifact-repository.write auto-creates parent directories on first write)
-      const sliceOutcome = await runSlicePlan(runtime, phase, slice.id, slice.title, slice.acceptanceCriteria);
+      const sliceOutcome = await runSlicePlan(
+        runtime,
+        phase,
+        slice.id,
+        slice.title,
+        slice.acceptanceCriteria,
+        slice.phaseDir,
+        runtime.state.requeueCounts[slice.id] ?? 0,
+        slice.lastReason,
+      );
       if (sliceOutcome.type === "escalate") {
         return escalateSlice(ctx, slice.id, sliceOutcome.reason, {
           classification: sliceOutcome.classification ?? "LOOP_DESIGN",
@@ -337,6 +346,9 @@ async function runSlicePlan(
   sliceId: string,
   sliceTitle: string,
   acceptanceCriteria: string[],
+  phaseDir: string,
+  requeueCount: number,
+  lastReason: string | undefined,
 ): Promise<RequeueResult | EscalateResult> {
   const goals = await safeReadArtifact(runtime, { kind: "goals" });
   const design = await safeReadArtifact(runtime, { kind: "design" });
@@ -346,14 +358,18 @@ async function runSlicePlan(
     runtime,
     "dl-slice-planner",
     [
+      `=== RUN ID ===\n${runtime.state.runId}`,
       `=== SLICE ID ===\n${sliceId}`,
       `=== SLICE TITLE ===\n${sliceTitle}`,
+      `=== PHASE DIR ===\n${phaseDir}`,
       `=== ACCEPTANCE CRITERIA ===\n${acceptanceCriteria.join("\n")}`,
-      `=== PHASE ===\n${phase}`,
+      `=== REQUEUE COUNT ===\n${requeueCount}`,
+      `=== REQUEUE REASON ===\n${lastReason ?? "None."}`,
       `=== GOALS ===\n${goals}`,
       `=== DESIGN ===\n${design}`,
       `=== STRUCTURE ===\n${structure}`,
     ].join("\n\n"),
+    { tools: ["read", "bash", "grep", "find", "ls", "write", "edit"] },
   );
 
   if (result.endReason === "aborted" || result.errorMessage) {
@@ -369,6 +385,19 @@ async function runSlicePlan(
       reason: sections["Summary"] ?? "Slice planner could not plan this slice.",
       classification,
     };
+  }
+
+  // Guard: verify planner actually wrote task specs before proceeding.
+  const written = await runtime.services.artifactRepo.listTaskSpecs(phase);
+  if (written.length === 0) {
+    await recordAnomaly(
+      runtime,
+      "slice-plan-empty",
+      "error",
+      `dl-slice-planner returned PASS but wrote no task specs into ${phaseDir}/tasks/.`,
+      { sliceId, phase },
+    );
+    return { type: "requeue", reason: "Slice planner produced no task specs." };
   }
 
   return { type: "continue" };

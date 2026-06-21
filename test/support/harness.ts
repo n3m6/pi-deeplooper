@@ -53,6 +53,8 @@ export interface HarnessOptions {
   interactionMode?: InteractionMode;
   failurePolicy?: FailurePolicy;
   reviewDepth?: ReviewDepth;
+  /** When true the dl-slice-planner mock returns PASS but writes no task specs (reproduces the production bug). */
+  slicePlannerWritesNoTasks?: boolean;
 }
 
 export class TestHarness {
@@ -106,6 +108,7 @@ export class TestHarness {
       verificationStatus: options.verificationStatus ?? "PASS",
       acceptanceStatus: options.acceptanceStatus ?? "PASS",
       backwardLoopRecommendation: options.backwardLoopRecommendation ?? "NO_LOOP",
+      slicePlannerWritesNoTasks: options.slicePlannerWritesNoTasks ?? false,
     });
     const ctx = createFakeCommandContext(workspaceRoot, pi);
     const progress = new NoopProgressReporter();
@@ -169,7 +172,10 @@ export class MockDispatcher implements Dispatcher {
   constructor(
     private readonly artifacts: RunArtifacts,
     private readonly options: Required<
-      Pick<HarnessOptions, "route" | "verificationStatus" | "acceptanceStatus" | "backwardLoopRecommendation">
+      Pick<
+        HarnessOptions,
+        "route" | "verificationStatus" | "acceptanceStatus" | "backwardLoopRecommendation" | "slicePlannerWritesNoTasks"
+      >
     >,
   ) {}
 
@@ -269,8 +275,17 @@ export class MockDispatcher implements Dispatcher {
         return textResult(
           "# Structure\n\n## File Map\n\n### Slice 1: Core\n| File | Action | Purpose |\n|------|--------|---------|\n| `src/example.ts` | MODIFY | Example work |\n",
         );
-      case "dl-slice-planner":
+      case "dl-slice-planner": {
+        if (!this.options.slicePlannerWritesNoTasks) {
+          const phaseDir = request.prompt.match(/=== PHASE DIR ===\n(.+)/)?.[1]?.trim() ?? "phases/phase-01";
+          const phaseSegment = phaseDir.split("/").at(-1) ?? "phase-01";
+          const sliceId = request.prompt.match(/=== SLICE ID ===\n(.+)/)?.[1]?.trim() ?? "S1";
+          const tasksDir = path.join(this.artifacts.phasesDir, phaseSegment, "tasks");
+          await mkdir(tasksDir, { recursive: true });
+          await writeFile(path.join(tasksDir, "task-01.md"), renderSliceTaskSpec("01", sliceId, "1"), "utf8");
+        }
         return textResult("### Status — PASS\n\n### Summary\nSlice planned.");
+      }
       case "dl-baseline-checker":
         return textResult(
           "### Baseline Status — CLEAN\n\n### Check Results\n| Check | Status | Command | Details |\n|-------|--------|---------|---------|\n| Build | PASS | `npm run build` | ok |\n| Tests | PASS | `npm run test` | ok |\n\n### Failure Inventory\nNone.\n\n### Stage Summary\nBaseline CLEAN.",
@@ -712,4 +727,43 @@ async function touchFile(filePath: string, content: string): Promise<void> {
 
 export async function readFileText(filePath: string): Promise<string> {
   return readFile(filePath, "utf8");
+}
+
+function renderSliceTaskSpec(taskId: string, sliceId: string, phase: string): string {
+  return [
+    `# Task ${taskId}: Health Check Endpoint`,
+    "",
+    "## Metadata",
+    `- **Task:** ${taskId}`,
+    `- **Slice:** ${sliceId}`,
+    `- **Phase:** ${phase}`,
+    "- **Route:** full",
+    "- **Mode:** slice",
+    "",
+    "## Dependencies",
+    "- None.",
+    "",
+    "## Description",
+    "Implement the endpoint described in design.",
+    "",
+    "## Files",
+    "| Path | Action | Purpose |",
+    "| --- | --- | --- |",
+    "| `src/health.ts` | CREATE | Health check handler |",
+    "",
+    "## Feasibility Checklist",
+    "- path-exists: src/",
+    "",
+    "## Done Checklist",
+    "- file-exists: src/health.ts",
+    "",
+    "## Test Expectations",
+    "- Endpoint returns 200 OK.",
+    "",
+    "## Slice Review Status",
+    "- **Planner State:** clean",
+    "- **Requeue Count:** 0",
+    "- **Previous Failure Addressed:** None.",
+    "- **Outstanding Concerns:** None.",
+  ].join("\n");
 }
