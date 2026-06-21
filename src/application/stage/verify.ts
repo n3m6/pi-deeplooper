@@ -30,6 +30,7 @@ export const verifyStage: StageModule = {
     const allIntegration = await readAllPhaseArtifacts(runtime, "integration-results.md");
     const allDoneChecks = await readAllPhaseArtifacts(runtime, "done-check-results.md");
     const allExecManifests = await readAllPhaseArtifacts(runtime, "execution-manifest.md");
+    const allRegressionResults = await readAllPhaseArtifacts(runtime, "regression-results.md");
 
     const verification = await dispatchLeaf(
       runtime,
@@ -55,6 +56,9 @@ export const verifyStage: StageModule = {
         "",
         "=== DONE-CHECK RESULTS ===",
         allDoneChecks,
+        "",
+        "=== PHASE REGRESSION RESULTS ===",
+        allRegressionResults,
         "",
         "=== BASELINE RESULTS ===",
         baselineResults,

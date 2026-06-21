@@ -5,7 +5,7 @@
  * Resume behavior: early-PASS when structure.md already exists.
  */
 
-import { parsePipeTable } from "../../infra/codec/markdown-codec.js";
+import { extractMarkdownDocument, parsePipeTable } from "../../infra/codec/markdown-codec.js";
 import { runAgentReviewLoop } from "../workflow/agent-review-loop.js";
 import { runFastImplLoopSubstage } from "./fast-impl-loop.js";
 import type { StageModule, StageOutcome, StageRuntime } from "../port/index.js";
@@ -136,7 +136,7 @@ export const skeletonStage: StageModule = {
           if (mapFailure) {
             return { failure: mapFailure, transient: isTransientDispatchFailure(mapResult) };
           }
-          await writeArtifact(runtime, { kind: "structure" }, mapResult.text);
+          await writeArtifact(runtime, { kind: "structure" }, extractMarkdownDocument(mapResult.text, "# Structure"));
         }
 
         const structureText = await readArtifact(runtime, { kind: "structure" });
@@ -171,7 +171,7 @@ export const skeletonStage: StageModule = {
         );
         const remapFailure = dispatchFailureSummary(remapResult, "Structure re-map failed");
         if (remapFailure) return { failure: remapFailure, transient: isTransientDispatchFailure(remapResult) };
-        await writeArtifact(runtime, { kind: "structure" }, remapResult.text);
+        await writeArtifact(runtime, { kind: "structure" }, extractMarkdownDocument(remapResult.text, "# Structure"));
       },
     });
 

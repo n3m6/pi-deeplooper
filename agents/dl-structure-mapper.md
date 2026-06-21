@@ -70,7 +70,8 @@ Execute these steps in order.
 
 ### Output Format
 
-````
+Return **only** the `# Structure` document as your entire response — no preamble, no shell exploration notes, no wrapping code fence. The first line of your response must be `# Structure` and nothing must appear before it.
+
 # Structure
 
 ## Project Layout
@@ -123,7 +124,6 @@ when they are listed as CREATE in ## File Map and labeled planned/CREATE in the 
 
 ## Convention Notes
 - [Naming conventions, directory patterns, or uncertainties downstream tasks must know.]
-````
 
 ### Invalid Outputs
 

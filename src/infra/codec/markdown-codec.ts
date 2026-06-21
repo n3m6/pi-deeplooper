@@ -253,6 +253,47 @@ export function parseSliceManifest(designMd: string): SliceManifestResult {
 }
 
 /**
+ * Extract a well-formed markdown document starting at the given anchor heading line.
+ *
+ * Strips:
+ *   - Everything before the first line that exactly matches `anchorHeading` (removes leaked
+ *     shell output, narration, and stray opening code fences that agents emit before the doc).
+ *   - A trailing unbalanced ``` line that some agents append after the document body
+ *     (inner ```mermaid / ```typescript / ```json blocks are left untouched).
+ *
+ * If the anchor heading is not found, returns the original text unchanged so callers always
+ * receive something writable.
+ */
+export function extractMarkdownDocument(text: string, anchorHeading: string): string {
+  const normalized = normalizeNewlines(text);
+  const lines = normalized.split("\n");
+
+  const anchorIdx = lines.findIndex((l) => l === anchorHeading);
+  if (anchorIdx === -1) return text;
+
+  const body = lines.slice(anchorIdx);
+
+  // Count fence opens vs closes. Each ``` line (regardless of language tag) toggles depth.
+  // An odd total means there is one unbalanced fence token.
+  let fenceDepth = 0;
+  for (const line of body) {
+    if (line.startsWith("```")) fenceDepth ^= 1;
+  }
+
+  // If unbalanced, find the last ``` line and remove it — that is the stray token.
+  if (fenceDepth !== 0) {
+    for (let i = body.length - 1; i >= 0; i--) {
+      if ((body[i] ?? "").startsWith("```")) {
+        body.splice(i, 1);
+        break;
+      }
+    }
+  }
+
+  return body.join("\n").trimEnd();
+}
+
+/**
  * Returns true when design.md declares any slices (i.e. contains `## Slice Manifest` or
  * `## Vertical Slices`). Used to distinguish "no slices intended" from "slices declared
  * but unparseable".

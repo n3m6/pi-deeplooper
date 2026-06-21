@@ -416,16 +416,26 @@ async function runFeasibilityCheck(
 ): Promise<RequeueResult & { result?: string }> {
   const goals = await safeReadArtifact(runtime, { kind: "goals" });
   const design = await safeReadArtifact(runtime, { kind: "design" });
+  const runRelativePhaseDir = `.pipeline/${runtime.state.runId}/phases/phase-${String(phase).padStart(2, "0")}`;
+
+  // Read task specs that dl-slice-planner just wrote so the checker has them verbatim.
+  const taskSpecIds = await runtime.services.artifactRepo.listTaskSpecs(phase);
+  const taskSpecTexts = (await Promise.all(taskSpecIds.map((id) => runtime.services.artifactRepo.read(id)))).filter(
+    (t): t is string => t !== undefined,
+  );
+  const taskSpecsSection = taskSpecTexts.join("\n\n---\n\n") || "(none)";
 
   const result = await dispatchLeaf(
     runtime,
     "dl-feasibility-checker",
     [
+      `=== RUN ID ===\n${runtime.state.runId}`,
       `=== SLICE ID ===\n${sliceId}`,
-      `=== PHASE ===\n${phase}`,
+      `=== PHASE DIR ===\n${runRelativePhaseDir}`,
       `=== ACCEPTANCE CRITERIA ===\n${acceptanceCriteria.join("\n")}`,
       `=== GOALS ===\n${goals}`,
       `=== DESIGN ===\n${design}`,
+      `=== TASK SPECS ===\n${taskSpecsSection}`,
     ].join("\n\n"),
   );
 
@@ -442,6 +452,19 @@ async function runFeasibilityCheck(
     return { type: "requeue", reason: sections["Summary"] ?? "Feasibility check: slice is not feasible as scoped." };
   }
 
+  // Guard: detect vacuous PASS (0 tasks checked) when task specs are present.
+  // This fires when the agent ignores the provided specs and returns a template response.
+  if (taskSpecIds.length > 0 && /"checked":\s*0/.test(result.text)) {
+    await recordAnomaly(
+      runtime,
+      "feasibility-vacuous",
+      "error",
+      `dl-feasibility-checker returned PASS but checked 0 tasks despite ${taskSpecIds.length} task spec(s) being present.`,
+      { sliceId, phase, taskSpecCount: taskSpecIds.length },
+    );
+    return { type: "requeue", reason: "Feasibility check vacuous PASS: 0 tasks checked while task specs exist." };
+  }
+
   return { type: "continue" as const };
 }
 
@@ -452,15 +475,25 @@ async function runDoneCheck(
   acceptanceCriteria: string[],
 ): Promise<{ status: "PASS" | "FAIL"; reason: string }> {
   const goals = await safeReadArtifact(runtime, { kind: "goals" });
+  const runRelativePhaseDir = `.pipeline/${runtime.state.runId}/phases/phase-${String(phase).padStart(2, "0")}`;
+
+  // Read task specs verbatim so the done-checker uses the real run ID and phase dir.
+  const taskSpecIds = await runtime.services.artifactRepo.listTaskSpecs(phase);
+  const taskSpecTexts = (await Promise.all(taskSpecIds.map((id) => runtime.services.artifactRepo.read(id)))).filter(
+    (t): t is string => t !== undefined,
+  );
+  const taskSpecsSection = taskSpecTexts.join("\n\n---\n\n") || "(none)";
 
   const result = await dispatchLeaf(
     runtime,
     "dl-done-checker",
     [
+      `=== RUN ID ===\n${runtime.state.runId}`,
       `=== SLICE ID ===\n${sliceId}`,
-      `=== PHASE ===\n${phase}`,
+      `=== PHASE DIR ===\n${runRelativePhaseDir}`,
       `=== ACCEPTANCE CRITERIA ===\n${acceptanceCriteria.join("\n")}`,
       `=== GOALS ===\n${goals}`,
+      `=== TASK SPECS ===\n${taskSpecsSection}`,
       `=== STAGE 7 SUMMARY ===`,
       (await runtime.services.artifactRepo.read({ kind: "phaseFile", phase, name: "stage7-summary.md" })) ?? "N/A",
     ].join("\n\n"),
