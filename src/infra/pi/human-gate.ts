@@ -15,6 +15,7 @@ import {
   createGoalsReturnTool as buildGoalsReturnTool,
   createInterviewReturnTool as buildInterviewReturnTool,
 } from "./stage-return-tool.js";
+import { matchEnum, INTERACTION_MODES, FAILURE_POLICIES, REVIEW_DEPTHS } from "./union-guard.js";
 
 export function parseExplicitRunOptions(args: string): ExplicitRunOptions {
   const options: ExplicitRunOptions = {};
@@ -24,17 +25,20 @@ export function parseExplicitRunOptions(args: string): ExplicitRunOptions {
   const review = args.match(/\breview:(thorough|fast)\b/i)?.[1]?.toLowerCase();
   const modelProfile = args.match(/\bmodels:([a-z0-9-]+)\b/i)?.[1]?.toLowerCase();
 
-  if (mode === "interactive" || mode === "automated") {
-    options.mode = mode;
+  const resolvedMode = matchEnum(mode, INTERACTION_MODES);
+  if (resolvedMode) {
+    options.mode = resolvedMode;
   }
-  if (failure === "fail-closed" || failure === "best-effort") {
-    options.failurePolicy = failure;
+  const resolvedFailure = matchEnum(failure, FAILURE_POLICIES);
+  if (resolvedFailure) {
+    options.failurePolicy = resolvedFailure;
   }
   if (resumeRunId) {
     options.resumeRunId = resumeRunId;
   }
-  if (review === "thorough" || review === "fast") {
-    options.reviewDepth = review;
+  const resolvedReview = matchEnum(review, REVIEW_DEPTHS);
+  if (resolvedReview) {
+    options.reviewDepth = resolvedReview;
   }
   if (modelProfile) {
     options.modelProfile = modelProfile;
@@ -90,6 +94,8 @@ export class DefaultGateManager implements GateManager {
       return undefined;
     }
     const rendered = options.map((option) => `${option.value}: ${option.label}`);
+    // ui.select is an optional host API added in newer pi versions; probe at runtime
+    // rather than relying on a static type to avoid errors on older hosts.
     const select = (this.ctx.ui as { select?: (prompt: string, options: string[]) => Promise<string | undefined> })
       .select;
     if (!select) {

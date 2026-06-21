@@ -74,6 +74,13 @@ export function nextSpinnerFrame(current: number): string {
   return SPINNER_FRAMES[current % SPINNER_FRAMES.length] ?? "⠋";
 }
 
+/** Returns the stage progress marker: "▶" if current, "✓" if completed, " " otherwise. */
+function stageMarker(isCurrent: boolean, isDone: boolean): string {
+  if (isCurrent) return "▶";
+  if (isDone) return "✓";
+  return " ";
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard widget (always visible during a run)
 // ---------------------------------------------------------------------------
@@ -96,15 +103,7 @@ export function renderDashboardLines(
   const stageRow = STAGE_ORDER.map((stage) => {
     const isDone = state.stagesCompleted.includes(stage);
     const isCurrent = view.currentStage === stage;
-    let marker: string;
-    if (isCurrent) {
-      marker = "▶";
-    } else if (isDone) {
-      marker = "✓";
-    } else {
-      marker = " ";
-    }
-    return `${stage}${marker}`;
+    return `${stage}${stageMarker(isCurrent, isDone)}`;
   }).join("  ");
 
   const stageStartedMs = view.stageStartedAt;

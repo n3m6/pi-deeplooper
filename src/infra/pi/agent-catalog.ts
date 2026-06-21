@@ -11,6 +11,7 @@ import type {
   LeafAgentDefinition,
   ThinkingLevelName,
 } from "../../application/port/index.js";
+import { matchEnum, THINKING_LEVELS } from "./union-guard.js";
 
 type RawFrontmatter = Record<string, unknown> & {
   name?: string;
@@ -24,6 +25,9 @@ type RawFrontmatter = Record<string, unknown> & {
 };
 
 const AGENTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "agents");
+
+/** Default max-turn budget when no `max_turns` frontmatter field is present. */
+const DEFAULT_MAX_TURNS = 40;
 
 export async function loadAgentDefinitions(): Promise<Map<string, LeafAgentDefinition>> {
   const files = (await readdir(AGENTS_DIR)).filter((entry) => entry.endsWith(".md") && entry.startsWith("dl-"));
@@ -47,7 +51,7 @@ export async function loadAgentDefinitions(): Promise<Map<string, LeafAgentDefin
       name,
       description: parsed.frontmatter.description ?? "",
       tools: parseCsv(parsed.frontmatter.tools ?? ""),
-      maxTurns: parsed.frontmatter.max_turns ?? 40,
+      maxTurns: parsed.frontmatter.max_turns ?? DEFAULT_MAX_TURNS,
       systemPromptMode: parsed.frontmatter.systemPromptMode ?? "replace",
       extensions: normalizeExtensions(parsed.frontmatter.extensions),
       filePath,
@@ -113,19 +117,5 @@ function normalizeExtensions(value: RawFrontmatter["extensions"]): string[] {
 }
 
 function toThinkingLevel(value: string | undefined): ThinkingLevelName | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const normalized = value.trim().toLowerCase();
-  if (
-    normalized === "off" ||
-    normalized === "minimal" ||
-    normalized === "low" ||
-    normalized === "medium" ||
-    normalized === "high" ||
-    normalized === "xhigh"
-  ) {
-    return normalized;
-  }
-  return undefined;
+  return value ? matchEnum(value.trim().toLowerCase(), THINKING_LEVELS) : undefined;
 }

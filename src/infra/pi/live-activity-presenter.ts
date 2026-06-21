@@ -14,6 +14,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { DomainEvent } from "../../domain/event/index.js";
 import type { RunState } from "../../application/port/index.js";
 import type { ActivityPresenter, SessionActivity } from "./session-activity.js";
+import { eventLabelFor } from "./event-label.js";
 import {
   ACTIVITY_BOX_MAX_LINES,
   BREADCRUMB_STRIP_MAX_LINES,
@@ -41,45 +42,22 @@ const BOX_THROTTLE_MS = 150;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Returns the strip breadcrumb line for a domain event, or undefined to skip. */
+/**
+ * Returns the TUI strip label for a domain event, or undefined to skip.
+ *
+ * Delegates to eventLabelFor() for shared cases. Overrides only where the strip
+ * intentionally differs from the transcript breadcrumbs:
+ *   - slice.started: uses ": " (breadcrumb uses " starting: ")
+ *   - slice.completed, requeue.requested, requeue.exhausted: not shown in the strip
+ */
 function stripLineFor(event: DomainEvent): string | undefined {
-  switch (event.type) {
-    case "run.started":
-      return `Deeplooper started - route ${event.route}`;
-    case "run.resumed":
-      return `Deeplooper resumed - route ${event.route}`;
-    case "run.completed":
-      return `Deeplooper ${event.status}`;
-    case "run.aborted":
-      return `Deeplooper aborted - ${event.error}`;
-    case "stage.started":
-      return `starting ${event.stage}`;
-    case "stage.completed":
-      return `OK ${event.stage} - ${event.outcome.summary}`;
-    case "stage.failed":
-      return `FAIL ${event.stage} - ${event.summary}`;
-    case "stage.skipped":
-      return `skip ${event.stage} (${event.summary})`;
-    case "backward_loop.decided":
-    case "backward_loop.reset":
-      return `loop back to ${event.targetStage}`;
-    case "backward_loop.failed":
-      return `backward-loop cap reached`;
-    case "gate.presented":
-      return `approval needed at ${event.stage}`;
-    case "gate.approved":
-      return `gate ${event.stage} approved`;
-    case "gate.rejected":
-      return `gate ${event.stage} rejected`;
-    case "slice.started":
-      return `slice ${event.sliceId}: ${event.sliceTitle}`;
-    case "review.round.started":
-      return `${event.stage} review round ${event.reviewRound}/${event.maxRounds}`;
-    case "task.completed":
-      return `task ${event.taskId} ${event.status === "PASS" ? "done" : "FAIL"} (wave ${event.wave})`;
-    default:
-      return undefined;
+  if (event.type === "slice.started") {
+    return `slice ${event.sliceId}: ${event.sliceTitle}`;
   }
+  if (event.type === "slice.completed" || event.type === "requeue.requested" || event.type === "requeue.exhausted") {
+    return undefined;
+  }
+  return eventLabelFor(event)?.line;
 }
 
 // ---------------------------------------------------------------------------

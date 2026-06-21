@@ -1,15 +1,5 @@
-import { access } from "node:fs/promises";
-
-import {
-  DefaultResourceLoader,
-  ModelRegistry,
-  SessionManager,
-  createAgentSession,
-  getAgentDir,
-  type AgentSessionEvent,
-  type AgentToolResult,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type {
@@ -17,34 +7,32 @@ import type {
   DispatchRequest,
   DispatchResult,
   Dispatcher,
-  LeafAgentDefinition,
   ModelPolicy,
   StageOutcome,
 } from "../../application/port/index.js";
-import type { ActivityPresenter } from "./session-activity.js";
-import { ActivityReporter } from "./session-activity.js";
+import { ActivityReporter, type ActivityPresenter } from "./session-activity.js";
+import { buildDefaultSessionFactory, type AgentSession, type SessionFactory } from "./session-factory.js";
+import { waitForPromptCompletion } from "./prompt-completion.js";
+import { resolveModel, mergeToolAllowlist, instrumentCustomTools } from "./model-resolution.js";
+import { extractAssistantText } from "./message-text.js";
 import { createStageReturnTool, normalizeStageReturn, type StageReturnPayload } from "./stage-return-tool.js";
 
-const DEFAULT_GENERIC_MAX_TURNS = 40;
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Tool names whose invocation signals that a stage has produced its structured result. */
+const RETURN_TOOL_NAMES: readonly string[] = ["stage_return", "goals_return", "interview_return"];
+
+/** Default tool set for generic-coding sessions when the caller does not override. */
+const DEFAULT_GENERIC_CODING_TOOLS: string[] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
 const DEFAULT_LEAF_TIMEOUT_MS = 3_600_000;
 const DEFAULT_GENERIC_TIMEOUT_MS = 600_000;
-type DispatchEndReason = NonNullable<DispatchResult["endReason"]>;
 
-export interface AgentSession {
-  subscribe(handler: (event: AgentSessionEvent) => void): () => void;
-  abort(): Promise<void>;
-  prompt(text: string, options: { source: string }): Promise<void>;
-  dispose(): void;
-  messages: unknown[];
-}
-
-export type SessionFactory = (
-  request: DispatchRequest,
-  customTools: ToolDefinition[],
-  toolAllowlist: string[],
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK Model generic; Phase 7 will wrap with opaque ModelHandle
-  model: Model<any> | undefined,
-) => Promise<AgentSession>;
+// ---------------------------------------------------------------------------
+// PiSessionDispatcher
+// ---------------------------------------------------------------------------
 
 export class PiSessionDispatcher implements Dispatcher {
   private readonly sessionFactory: SessionFactory;
@@ -57,87 +45,24 @@ export class PiSessionDispatcher implements Dispatcher {
     private readonly presenter?: ActivityPresenter,
     private readonly modelPolicy?: ModelPolicy,
   ) {
-    this.sessionFactory = sessionFactory ?? this.buildDefaultSessionFactory();
+    this.sessionFactory = sessionFactory ?? buildDefaultSessionFactory(this.modelRegistry);
   }
 
-  private buildDefaultSessionFactory(): SessionFactory {
-    return async (request, customTools, toolAllowlist, model) => {
-      const target = request.target;
-      const isLeaf = target.kind === "leaf";
-      const loader = new DefaultResourceLoader({
-        cwd: request.cwd,
-        agentDir: getAgentDir(),
-        noExtensions: true,
-        noSkills: true,
-        noPromptTemplates: true,
-        noThemes: true,
-        noContextFiles: true,
-        additionalExtensionPaths: isLeaf ? await existingPaths(target.extensions) : [],
-        ...(isLeaf && target.systemPromptMode === "replace"
-          ? { systemPromptOverride: (base: string | undefined) => target.body || base }
-          : {}),
-        ...(isLeaf && target.systemPromptMode === "append"
-          ? { appendSystemPromptOverride: (base: string[]) => [...base, target.body] }
-          : {}),
-      });
-      await loader.reload();
-
-      const sessionOptions = {
-        cwd: request.cwd,
-        agentDir: getAgentDir(),
-        modelRegistry: this.modelRegistry,
-        thinkingLevel: (request.target.thinkingLevel ?? "high") as never,
-        maxTurns: isLeaf ? target.maxTurns : DEFAULT_GENERIC_MAX_TURNS,
-        tools: toolAllowlist,
-        customTools,
-        resourceLoader: loader,
-        sessionManager: SessionManager.inMemory(request.cwd),
-        ...(model ? { model } : {}),
-      };
-      const { session } = await createAgentSession(sessionOptions);
-      return session as AgentSession;
-    };
-  }
+  // ---------------------------------------------------------------------------
+  // Public dispatch methods
+  // ---------------------------------------------------------------------------
 
   async dispatch(request: DispatchRequest): Promise<DispatchResult> {
-    const customToolCalls: DispatchCustomToolCall[] = [];
-    let resolveStageReturn: (() => void) | undefined;
-    const stageReturn = new Promise<void>((resolve) => {
-      resolveStageReturn = resolve;
-    });
-    // Cast opaque CustomTool[] to SDK ToolDefinition[] at the infrastructure boundary
-    const sdkTools = (request.customTools ?? []) as unknown as ToolDefinition[];
-    const customTools = instrumentCustomTools(sdkTools, customToolCalls, (toolName) => {
-      if (toolName === "stage_return" || toolName === "goals_return" || toolName === "interview_return") {
-        resolveStageReturn?.();
-      }
-    });
+    const { customTools, customToolCalls, stageReturn } = this.buildInstrumentedTools(request);
     const target = request.target;
     const isLeaf = target.kind === "leaf";
     const toolAllowlist = mergeToolAllowlist(target.tools, request.tools, customTools);
-    const routing = this.modelPolicy?.resolve(target);
-    // Precedence: tier-profile model (from .deeplooper/models.json) -> the agent's own
-    // frontmatter model: -> pi session default. The frontmatter fallback keeps agents
-    // honoring their declared model when no profile binding covers their tier.
-    const modelName = routing?.modelName ?? (isLeaf ? target.modelName : undefined);
-    const model = resolveModel(this.modelRegistry, this.currentModel, modelName);
-    // When the policy supplies a thinking override, propagate it into the request
-    // so the session factory (which reads request.target.thinkingLevel) picks it up.
-    const effectiveRequest =
-      routing?.thinkingLevel !== undefined
-        ? { ...request, target: { ...target, thinkingLevel: routing.thinkingLevel } }
-        : request;
+    const { effectiveRequest, model } = this.buildModelRouting(request);
     const session = await this.sessionFactory(effectiveRequest, customTools, toolAllowlist, model);
 
-    // Attach live-activity reporter if a presenter is configured
     const correlationId = request.correlationId ?? request.target.name;
     const activityLabel = request.activityLabel ?? request.target.name;
-    const reporter = this.presenter ? new ActivityReporter(correlationId, this.presenter) : undefined;
-
-    if (reporter && this.presenter) {
-      this.presenter.onSessionStart(correlationId, activityLabel);
-      reporter.attach(session);
-    }
+    const reporter = this.attachReporter(session, correlationId, activityLabel);
 
     try {
       const endReason = await waitForPromptCompletion(
@@ -147,9 +72,8 @@ export class PiSessionDispatcher implements Dispatcher {
         request.signal,
         request.timeoutMs ?? (isLeaf ? DEFAULT_LEAF_TIMEOUT_MS : DEFAULT_GENERIC_TIMEOUT_MS),
       );
-      const text = extractAssistantText(session.messages);
       return {
-        text,
+        text: extractAssistantText(session.messages),
         messages: session.messages,
         customToolCalls,
         endReason,
@@ -192,7 +116,7 @@ export class PiSessionDispatcher implements Dispatcher {
       target: {
         kind: "generic",
         name: "generic-coding",
-        tools: options?.tools ?? ["read", "bash", "edit", "write", "grep", "find", "ls"],
+        tools: options?.tools ?? DEFAULT_GENERIC_CODING_TOOLS,
         thinkingLevel: "high",
       },
       prompt,
@@ -204,162 +128,80 @@ export class PiSessionDispatcher implements Dispatcher {
     });
     return normalizeStageReturn(result);
   }
-}
 
-export async function waitForPromptCompletion(
-  session: AgentSession,
-  prompt: string,
-  stageReturn: Promise<void>,
-  signal?: AbortSignal,
-  timeoutMs?: number,
-): Promise<DispatchEndReason> {
-  if (signal?.aborted) {
-    void session.abort().catch(() => undefined);
-    return "aborted";
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  /** Instruments the request's custom tools and wires the stage-return promise. */
+  private buildInstrumentedTools(request: DispatchRequest): {
+    customTools: ToolDefinition[];
+    customToolCalls: DispatchCustomToolCall[];
+    stageReturn: Promise<void>;
+  } {
+    const customToolCalls: DispatchCustomToolCall[] = [];
+    let resolveStageReturn: (() => void) | undefined;
+    const stageReturn = new Promise<void>((resolve) => {
+      resolveStageReturn = resolve;
+    });
+    // Cast opaque CustomTool[] to SDK ToolDefinition[] at the infrastructure boundary
+    const sdkTools = (request.customTools ?? []) as unknown as ToolDefinition[];
+    const customTools = instrumentCustomTools(sdkTools, customToolCalls, (toolName) => {
+      if (RETURN_TOOL_NAMES.includes(toolName)) {
+        resolveStageReturn?.();
+      }
+    });
+    return { customTools, customToolCalls, stageReturn };
   }
 
-  let resolveDone!: (reason: DispatchEndReason) => void;
-  const done = new Promise<DispatchEndReason>((resolve) => {
-    resolveDone = resolve;
-  });
+  /* eslint-disable @typescript-eslint/no-explicit-any -- SDK Model generic; Phase 7 will introduce opaque ModelHandle */
+  /**
+   * Resolves the effective model and request to use for this dispatch.
+   *
+   * Precedence for model: tier-profile binding → leaf agent frontmatter → pi session default.
+   * When the policy supplies a thinking override it is merged into the returned request
+   * so the session factory picks it up.
+   */
+  private buildModelRouting(request: DispatchRequest): {
+    effectiveRequest: DispatchRequest;
+    model: Model<any> | undefined;
+  } {
+    const target = request.target;
+    const routing = this.modelPolicy?.resolve(target);
+    const leafModelName = target.kind === "leaf" ? target.modelName : undefined;
+    const modelName = routing?.modelName ?? leafModelName;
+    const model = resolveModel(this.modelRegistry, this.currentModel, modelName);
+    const effectiveRequest =
+      routing?.thinkingLevel !== undefined
+        ? { ...request, target: { ...target, thinkingLevel: routing.thinkingLevel } }
+        : request;
+    return { effectiveRequest, model };
+  }
+  /* eslint-enable @typescript-eslint/no-explicit-any */
 
-  const unsubscribe = session.subscribe((event) => {
-    if (event.type === "agent_end") {
-      resolveDone("agent_end");
-    }
-  });
-
-  const abortListener = () => {
-    void session.abort().catch(() => undefined);
-    resolveDone("aborted");
-  };
-  signal?.addEventListener("abort", abortListener, { once: true });
-
-  let timeout: NodeJS.Timeout | undefined;
-  const timeoutPromise = new Promise<DispatchEndReason>((resolve) => {
-    if (!timeoutMs || timeoutMs <= 0) {
-      return;
-    }
-    timeout = setTimeout(() => {
-      void session.abort().catch(() => undefined);
-      resolve("timeout");
-    }, timeoutMs);
-  });
-
-  try {
-    return await Promise.race([
-      session.prompt(prompt, { source: "extension" }).then(() => "agent_end" as const),
-      done,
-      stageReturn.then(() => {
-        void session.abort().catch(() => undefined);
-        return "stage_return" as const;
-      }),
-      timeoutPromise,
-    ]);
-  } finally {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-    signal?.removeEventListener("abort", abortListener);
-    unsubscribe();
+  /**
+   * Attaches a live-activity reporter to the session if a presenter is configured.
+   * Returns the reporter (for later detach) or undefined in headless runs.
+   */
+  private attachReporter(
+    session: AgentSession,
+    correlationId: string,
+    activityLabel: string,
+  ): ActivityReporter | undefined {
+    if (!this.presenter) return undefined;
+    const reporter = new ActivityReporter(correlationId, this.presenter);
+    this.presenter.onSessionStart(correlationId, activityLabel);
+    reporter.attach(session);
+    return reporter;
   }
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any -- resolveModel works with SDK Model generic; Phase 7 will introduce opaque ModelHandle */
-export function resolveModel(
-  modelRegistry: ModelRegistry,
-  currentModel: Model<any> | undefined,
-  desiredModelName: string | undefined,
-): Model<any> | undefined {
-  const all = modelRegistry.getAll();
-  if (desiredModelName) {
-    const exact = all.find(
-      (model) => model.id === desiredModelName || `${model.provider}/${model.id}` === desiredModelName,
-    );
-    if (exact) {
-      return exact;
-    }
-  }
-  return currentModel ?? modelRegistry.getAvailable()[0] ?? all[0];
-}
-/* eslint-enable @typescript-eslint/no-explicit-any */
+// ---------------------------------------------------------------------------
+// Re-exports — keep all symbols importable from this module's original path
+// ---------------------------------------------------------------------------
 
-export function mergeToolAllowlist(
-  targetTools: string[],
-  overrideTools: string[] | undefined,
-  customTools: ToolDefinition[],
-): string[] {
-  const base = overrideTools ?? targetTools;
-  const customNames = customTools.map((tool) => tool.name);
-  return [...new Set([...base, ...customNames])];
-}
-
-export function instrumentCustomTools<T extends ToolDefinition[]>(
-  tools: T,
-  sink: DispatchCustomToolCall[],
-  onToolCall: (toolName: string) => void,
-): T {
-  return tools.map((tool) => ({
-    ...tool,
-    async execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-      const result = await tool.execute(toolCallId, params, signal, onUpdate, ctx);
-      sink.push({ name: tool.name, result });
-      onToolCall(tool.name);
-      return result;
-    },
-  })) as T;
-}
-
-export async function existingPaths(paths: string[]): Promise<string[]> {
-  const existing: string[] = [];
-  for (const filePath of paths) {
-    try {
-      await access(filePath);
-      existing.push(filePath);
-    } catch {
-      // Ignore missing optional extensions.
-    }
-  }
-  return existing;
-}
-
-export function extractAssistantText(messages: unknown[]): string {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index] as { role?: string; content?: unknown };
-    if (message?.role !== "assistant") {
-      continue;
-    }
-    return contentToText(message.content);
-  }
-  return "";
-}
-
-export function contentToText(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content
-      .map((item) => {
-        if (typeof item === "string") {
-          return item;
-        }
-        if (
-          item &&
-          typeof item === "object" &&
-          "text" in item &&
-          typeof (item as { text?: unknown }).text === "string"
-        ) {
-          return (item as { text: string }).text;
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-  return "";
-}
-
-export function buildLeafPrompt(definition: LeafAgentDefinition, prompt: string): string {
-  return `${definition.body.trim()}\n\n${prompt.trim()}`;
-}
+export type { AgentSession, SessionFactory } from "./session-factory.js";
+export { waitForPromptCompletion } from "./prompt-completion.js";
+export { resolveModel, mergeToolAllowlist, instrumentCustomTools } from "./model-resolution.js";
+export { extractAssistantText, contentToText, buildLeafPrompt } from "./message-text.js";
+export { existingPaths } from "./fs-paths.js";

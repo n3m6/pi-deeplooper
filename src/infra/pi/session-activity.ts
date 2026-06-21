@@ -13,6 +13,7 @@ import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 
 import type { RunState } from "../../application/port/index.js";
 import type { DomainEvent } from "../../domain/event/index.js";
+import { textFromContentParts } from "./content-text.js";
 
 // ---------------------------------------------------------------------------
 // SessionActivity union
@@ -116,22 +117,11 @@ export function mapAgentSessionEvent(event: AgentSessionEvent): SessionActivity 
 }
 
 function extractPartialText(partial: { content?: Array<{ type?: string; text?: string }> } | undefined): string {
-  if (!partial?.content) return "";
-  return partial.content
-    .filter((c) => c.type === "text" && typeof c.text === "string")
-    .map((c) => c.text ?? "")
-    .join("");
+  return textFromContentParts(partial?.content);
 }
 
 function extractMessageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return (content as Array<{ type?: string; text?: string }>)
-      .filter((c) => c.type === "text" && typeof c.text === "string")
-      .map((c) => c.text ?? "")
-      .join("");
-  }
-  return "";
+  return textFromContentParts(content);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +157,6 @@ export class ActivityReporter {
 
       const activity = mapAgentSessionEvent(event);
       if (activity) {
-        // Override turn count with local count for turn_start (already handled above)
         this.presenter.onSessionActivity(this.correlationId, activity);
       }
     });
