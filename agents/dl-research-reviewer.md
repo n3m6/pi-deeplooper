@@ -30,6 +30,7 @@ Apply the relevant subset for the current mode.
 
 - **Objectivity** — observed facts only; no prescriptive language or unsupported inference
 - **Citation quality** — codebase claims have exact `file:line` references; web claims have source URLs
+- **Tooling failure** — if an artifact contains literal `<tool_call>`, `<bash>`, or similar markup tags as plain text, or if it names external sources without quoting any fetched content, the researcher did not execute its tools. Flag this explicitly as a *tooling failure* (not a coverage gap) so the orchestrator can distinguish it from a researcher that ran but found nothing. A tooling failure is always a FAIL regardless of other artifact quality.
 - **Coverage** — materially answers the assigned question, or explicitly states no relevant code or sources were found
 
 **Summary artifact:**
@@ -84,8 +85,9 @@ rerun-current-batch | ready-for-outer-loop
 Batch-pass rules:
 
 - PASS only when no material artifact issue remains.
+- Any tooling failure (literal markup or unquoted sources as described above) is automatically a FAIL — do not route to `ready-for-outer-loop` when a tooling failure is present.
 - Open questions are allowed on PASS if they are explicitly called out in `### Open Questions Assessment` and the artifacts are otherwise sound enough for the outer loop to decide what to do next.
-- Use `rerun-current-batch` only when the current batch artifacts themselves are defective.
+- Use `rerun-current-batch` only when the current batch artifacts themselves are defective (including tooling failures).
 - Use `ready-for-outer-loop` when the batch artifacts are locally sound, even if they leave unresolved open questions for later follow-up.
 
 #### `cumulative-loop`

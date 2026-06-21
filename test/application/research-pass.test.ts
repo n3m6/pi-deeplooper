@@ -395,3 +395,336 @@ function textResult(text: string): DispatchResult {
     endReason: "agent_end",
   };
 }
+
+// ---------------------------------------------------------------------------
+// No-evidence detection tests
+// ---------------------------------------------------------------------------
+
+test("web researcher emitting inert tool-call markup is flagged as no-evidence and records anomaly", async () => {
+  const harness = await TestHarness.create();
+  harnesses.push(harness);
+
+  const recordedEvents: DomainEvent[] = [];
+  const capturingTelemetry = {
+    record: async (event: DomainEvent) => {
+      recordedEvents.push(event);
+    },
+    regenerateRunLog: async () => {},
+    regenerateMetrics: async () => {},
+    readEvents: async () => [],
+  };
+
+  // The researcher returns literal <tool_call> markup — no real findings.
+  const inertText = [
+    "<tool_calls>",
+    '<tool_call name="websearch">best tsconfig.json for node</tool_call>',
+    "</tool_calls>",
+  ].join("\n");
+
+  const dispatcher = new InertWebResearcherDispatcher(harness.artifacts, inertText);
+  const questionsMarkdown = renderWebQuestionsMarkdown();
+  await writeFile(harness.artifacts.researchQuestionsFile, questionsMarkdown, "utf8");
+
+  const result = await runResearchPassSubstage(
+    {
+      ...harness.runtime(),
+      services: {
+        ...harness.services,
+        telemetrySink: capturingTelemetry,
+        dispatcher,
+      },
+    },
+    questionsMarkdown,
+  );
+
+  // The anomaly should be recorded even though the pipeline still proceeds (best-effort).
+  const anomalies = recordedEvents.filter(
+    (e): e is Extract<DomainEvent, { type: "pipeline.anomaly" }> => e.type === "pipeline.anomaly",
+  );
+  assert.ok(
+    anomalies.some((e) => e.code === "research-no-evidence"),
+    "expected a research-no-evidence anomaly event",
+  );
+
+  // noEvidence flag must be set on the result.
+  assert.equal(result.noEvidence, true, "result.noEvidence should be true when researcher emits inert markup");
+
+  // Under best-effort the run proceeds; result should not be a hard dispatch failure.
+  assert.equal(result.dispatchFailure, undefined);
+});
+
+test("web researcher returning no URLs and no sentinel is flagged as no-evidence", async () => {
+  const harness = await TestHarness.create();
+  harnesses.push(harness);
+
+  const recordedEvents: DomainEvent[] = [];
+  const capturingTelemetry = {
+    record: async (event: DomainEvent) => {
+      recordedEvents.push(event);
+    },
+    regenerateRunLog: async () => {},
+    regenerateMetrics: async () => {},
+    readEvents: async () => [],
+  };
+
+  // No URLs, no sentinel, no tool calls in messages.
+  const emptyText = "Some notes about argument parsing but no citations.";
+
+  const dispatcher = new InertWebResearcherDispatcher(harness.artifacts, emptyText);
+  const questionsMarkdown = renderWebQuestionsMarkdown();
+  await writeFile(harness.artifacts.researchQuestionsFile, questionsMarkdown, "utf8");
+
+  const result = await runResearchPassSubstage(
+    {
+      ...harness.runtime(),
+      services: {
+        ...harness.services,
+        telemetrySink: capturingTelemetry,
+        dispatcher,
+      },
+    },
+    questionsMarkdown,
+  );
+
+  const anomalies = recordedEvents.filter(
+    (e): e is Extract<DomainEvent, { type: "pipeline.anomaly" }> => e.type === "pipeline.anomaly",
+  );
+  assert.ok(
+    anomalies.some((e) => e.code === "research-no-evidence"),
+    "expected a research-no-evidence anomaly for text with no URL and no sentinel",
+  );
+  assert.equal(result.noEvidence, true);
+});
+
+test("no-evidence hint is prepended to the researcher prompt on rewrite", async () => {
+  const harness = await TestHarness.create();
+  harnesses.push(harness);
+
+  const inertText = [
+    "<tool_calls>",
+    '<tool_call name="websearch">best tsconfig.json for node</tool_call>',
+    "</tool_calls>",
+  ].join("\n");
+
+  const trackingDispatcher = new TrackingInertWebResearcherDispatcher(harness.artifacts, inertText);
+  const questionsMarkdown = renderWebQuestionsMarkdown();
+  await writeFile(harness.artifacts.researchQuestionsFile, questionsMarkdown, "utf8");
+
+  await runResearchPassSubstage(
+    {
+      ...harness.runtime(),
+      services: {
+        ...harness.services,
+        dispatcher: trackingDispatcher,
+      },
+    },
+    questionsMarkdown,
+  );
+
+  // After a FAIL review, the researcher is dispatched again. The rewrite prompt
+  // should contain the explicit no-evidence corrective hint.
+  assert.ok(
+    trackingDispatcher.webPrompts.length >= 2,
+    "researcher should be dispatched at least twice (initial + rewrite)",
+  );
+  const rewritePrompt = trackingDispatcher.webPrompts[1] ?? "";
+  assert.match(
+    rewritePrompt,
+    /IMPORTANT: Your previous research attempt produced no usable findings/,
+    "rewrite prompt should include the no-evidence corrective hint",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// No-progress guard test
+// ---------------------------------------------------------------------------
+
+test("review loop stops early and records review-loop-no-progress when artifacts are unchanged across rounds", async () => {
+  const harness = await TestHarness.create();
+  harnesses.push(harness);
+
+  const recordedEvents: DomainEvent[] = [];
+  const capturingTelemetry = {
+    record: async (event: DomainEvent) => {
+      recordedEvents.push(event);
+    },
+    regenerateRunLog: async () => {},
+    regenerateMetrics: async () => {},
+    readEvents: async () => [],
+  };
+
+  // Dispatcher: researcher produces real content, but reviewer always FAILs,
+  // and the rewrite researcher returns the *same* content each time so the
+  // artifact hash never changes across rounds.
+  const dispatcher = new StaleRewriteResearchDispatcher(harness.artifacts);
+  const questionsMarkdown = renderQuestionsMarkdown();
+  await writeFile(harness.artifacts.researchQuestionsFile, questionsMarkdown, "utf8");
+
+  const result = await runResearchPassSubstage(
+    {
+      ...harness.runtime(),
+      services: {
+        ...harness.services,
+        telemetrySink: capturingTelemetry,
+        dispatcher,
+      },
+    },
+    questionsMarkdown,
+  );
+
+  assert.equal(result.status, "FAIL");
+
+  const anomalies = recordedEvents.filter(
+    (e): e is Extract<DomainEvent, { type: "pipeline.anomaly" }> => e.type === "pipeline.anomaly",
+  );
+  assert.ok(
+    anomalies.some((e) => e.code === "review-loop-no-progress"),
+    "expected a review-loop-no-progress anomaly",
+  );
+
+  // Should stop after round 2 (round 1 sets the baseline, round 2 detects no change).
+  // With thorough mode (max 3 rounds), stopping at round 2 means fewer than max rounds.
+  assert.ok(result.reviewRounds < 3, `loop should stop before the 3-round cap; got ${result.reviewRounds}`);
+});
+
+// ---------------------------------------------------------------------------
+// Supporting dispatchers for the new tests
+// ---------------------------------------------------------------------------
+
+/** Dispatcher where dl-web-researcher always returns the provided inert/empty text. */
+class InertWebResearcherDispatcher implements Dispatcher {
+  constructor(
+    private readonly artifacts: RunArtifacts,
+    private readonly inertText: string,
+  ) {}
+
+  async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    switch (request.target.name) {
+      case "dl-web-researcher":
+        // Return inert text with no tool_use entries in messages.
+        return {
+          text: this.inertText,
+          messages: [{ role: "assistant", content: this.inertText }],
+          customToolCalls: [],
+          endReason: "agent_end",
+        };
+      case "dl-research-synthesizer": {
+        await writeFile(
+          this.artifacts.researchSummaryFile,
+          "# Research Summary\n\n## Overview\nNo evidence available.\n",
+          "utf8",
+        );
+        return textResult("### Status — PASS\n### Summary — Synthesized (empty).");
+      }
+      case "dl-research-reviewer":
+        return textResult("### Status — PASS\n\n### Summary\nPass.");
+      default:
+        return textResult("### Status — PASS\n\n### Summary\nPass.");
+    }
+  }
+
+  async dispatchParallel(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    return Promise.all(requests.map((r) => this.dispatch(r)));
+  }
+
+  async dispatchChain(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    const results: DispatchResult[] = [];
+    for (const r of requests) results.push(await this.dispatch(r));
+    return results;
+  }
+
+  async dispatchGenericCoding() {
+    return { status: "PASS" as const, filesWritten: [], summary: "" };
+  }
+}
+
+/** Like InertWebResearcherDispatcher but tracks all web researcher prompts for assertion. */
+class TrackingInertWebResearcherDispatcher extends InertWebResearcherDispatcher {
+  readonly webPrompts: string[] = [];
+  private reviewCount = 0;
+
+  override async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    if (request.target.name === "dl-web-researcher") {
+      this.webPrompts.push(request.prompt);
+    }
+    if (request.target.name === "dl-research-reviewer") {
+      this.reviewCount += 1;
+      if (this.reviewCount === 1) {
+        // Fail the first review so the rewrite path is exercised.
+        return textResult(
+          [
+            "### Status — FAIL",
+            "",
+            "### Artifact Findings",
+            "| Artifact | Status | Review Area | Notes |",
+            "|----------|--------|-------------|-------|",
+            "| `research/q1.md` | FAIL | Coverage | No real findings. |",
+            "",
+            "### Per-Question Issues",
+            "1. Q1 artifact is empty of factual findings.",
+            "",
+            "### Summary",
+            "FAIL — Q1 needs real research.",
+          ].join("\n"),
+        );
+      }
+    }
+    return super.dispatch(request);
+  }
+}
+
+/** Dispatcher where the reviewer always FAILs and rewrites produce identical artifacts. */
+class StaleRewriteResearchDispatcher implements Dispatcher {
+  private static readonly STABLE_FINDINGS =
+    "## Findings for Q1\n\n### Summary\nStable findings (unchanged).\n\n### References\n- `src/example.ts:1` — reference.\n";
+
+  constructor(private readonly artifacts: RunArtifacts) {}
+
+  async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    switch (request.target.name) {
+      case "dl-codebase-researcher":
+        return textResult(StaleRewriteResearchDispatcher.STABLE_FINDINGS);
+      case "dl-research-synthesizer": {
+        await writeFile(
+          this.artifacts.researchSummaryFile,
+          "# Research Summary\n\n## Overview\nStable summary.\n",
+          "utf8",
+        );
+        return textResult("### Status — PASS\n### Summary — Stable.");
+      }
+      case "dl-research-reviewer":
+        return textResult(
+          [
+            "### Status — FAIL",
+            "",
+            "### Artifact Findings",
+            "| Artifact | Status | Review Area | Notes |",
+            "|----------|--------|-------------|-------|",
+            "| `research/q1.md` | FAIL | Coverage | Needs more detail. |",
+            "",
+            "### Per-Question Issues",
+            "1. Q1 needs narrower scope.",
+            "",
+            "### Summary",
+            "FAIL — Q1 incomplete.",
+          ].join("\n"),
+        );
+      default:
+        return textResult("### Status — PASS\n\n### Summary\nPass.");
+    }
+  }
+
+  async dispatchParallel(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    return Promise.all(requests.map((r) => this.dispatch(r)));
+  }
+
+  async dispatchChain(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    const results: DispatchResult[] = [];
+    for (const r of requests) results.push(await this.dispatch(r));
+    return results;
+  }
+
+  async dispatchGenericCoding() {
+    return { status: "PASS" as const, filesWritten: [], summary: "" };
+  }
+}

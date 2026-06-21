@@ -34,7 +34,7 @@ Flag material issues in:
 - **Field completeness** — all four fields present: `Tag`, `Covers`, `Answer shape`, `Decision unblocked`.
 - **Covers** — cites only IDs from the normalized goal inventory.
 - **Bounded scope** — `Answer shape` names a concrete artifact form, a scope boundary, and a completion condition.
-- **Decision necessity** — `Decision unblocked` names one primary real downstream decision.
+- **Decision necessity** — `Decision unblocked` names one primary downstream decision that is **(a) genuinely open** (not determined by stable universal convention) **and (b) consequential** (its answer would materially change the design or implementation approach for this task). Flag any question whose unblocked decision would be answered identically regardless of research (e.g. "what HTTP status code does a health endpoint return" or "what tsconfig target suits a Node.js project") — those are convention-settled and should not generate a question.
 - **Incremental necessity** _(follow-up only)_ — the question is a genuinely new incremental question, not a material duplicate of a prior ledger question unless it clearly narrows the unresolved scope.
 
 ### Set-Level Checks
@@ -42,8 +42,9 @@ Flag material issues in:
 Flag material issues in:
 
 - **Coverage contract**
-  - `initial` mode — every normalized goal ID appears in at least one question's `Covers` field.
+  - `initial` mode — every normalized goal ID either appears in at least one question's `Covers` field OR is validly excluded by the settled-by-convention rule (see Decision necessity above).
   - `follow-up` mode — every still-material open question is covered by at least one batch question or is explicitly already answered by the supplied current research summary.
+- **Proportionality** — batch size should be proportionate to the number of genuinely open unknowns. Flag batches where question count is disproportionately large relative to the inventory size or task complexity (e.g. more than one question per simple inventory item, or `web`/`hybrid` questions for decisions determined by published standards). A near-empty or empty batch is valid and correct when all inventory items are convention-covered.
 - **Dependency materiality** — dependency-validation questions exist only when they could materially affect approach, compatibility, maintenance risk, or verification strategy.
 - **Redundancy** — no two batch questions ask materially the same thing.
 - **Follow-up scope discipline** _(follow-up only)_ — no batch question escapes the supplied open-question scope.
@@ -85,8 +86,9 @@ Flag material issues in:
 ### Rules
 
 - PASS only when every per-question check passes and the active coverage contract has no material gaps.
-- In `initial` mode, FAIL when any normalized inventory ID is uncovered.
+- In `initial` mode, FAIL when any normalized inventory ID is uncovered **and not validly excluded by the settled-by-convention rule**. Do not FAIL for uncovered IDs that are convention-settled.
 - In `follow-up` mode, FAIL when any still-material open question is uncovered, when a question materially duplicates the ledger without narrowing scope, or when a question escapes the supplied open-question scope.
+- Flag (but do not hard-FAIL) a batch for disproportionate size under the Proportionality check; provide improvement guidance to prune convention-settled questions.
 - Always emit `### Traceability Matrix`.
 - Write `None.` under `### Set-Level Findings` and `### Improvement Guidance` when no issues exist.
 - Leakage is out of scope; the leakage reviewer handles it.

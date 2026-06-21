@@ -16,8 +16,9 @@ Researchers never see the goals, so every question must remain neutral and prese
 
 ### Completeness Contract
 
-- **Initial mode:** the normalized goal inventory (`FR-*`, `NFR-*`, `C-*`, `AC-*`) is authoritative. Cover every item at least once.
+- **Initial mode:** the normalized goal inventory (`FR-*`, `NFR-*`, `C-*`, `AC-*`) is authoritative. Cover every item that has a *genuinely open unknown* — see the Settled-by-Convention exclusion below. Items whose decisions are fully determined by ubiquitous stable conventions do not require a question; the design can record those conventions directly.
 - **Follow-up mode:** the supplied `Open Questions` block is authoritative for this batch. Generate only the minimum new questions needed to resolve those unresolved areas. Use the question ledger to avoid materially duplicating already-asked questions.
+- **Empty batch is valid:** if every inventory item is convention-covered or already answered, emit `# Research Questions\n\n_No open unknowns identified — all decisions are determined by stable conventions or existing artifacts._` rather than generating unnecessary questions.
 
 ### Neutrality Contract
 
@@ -69,7 +70,8 @@ Shared rules:
 - Same evidence + same downstream decision → merge into one question.
 - No primary downstream decision → drop or merge into the question that does.
 - Incidental dependencies do not earn their own questions.
-- Return as many questions as needed for the active completeness contract — do not optimize for a fixed count.
+- **Settled-by-convention exclusion:** if a decision is fully determined by a ubiquitous, stable convention (e.g. standard REST status codes, canonical `tsconfig.json` options for a standard Node target, idiomatic framework middleware order, standard HTTP health-check response shape), do not generate a question. Record the convention in the design directly. Apply this exclusion when all three hold: (a) the answer is the same in ≥95% of similar projects, (b) the answer is documented in the official toolchain docs without variation, and (c) deviation would require an explicit reason independent of this task.
+- Return as many questions as needed for the active completeness contract — do not optimize for a fixed count. Zero questions is the correct answer when every unknown is convention-covered.
 
 **Step 2 — Draft questions**
 
@@ -130,5 +132,7 @@ Apply neutrality rewrites to every question:
 - [ ] Questions sharing the same evidence and primary downstream decision are merged.
 - [ ] `hybrid` is used only when splitting into `codebase` + `web` would make the question incoherent.
 - [ ] Reviewer-flagged questions are materially rewritten or dropped.
-- [ ] If `mode = initial`, every normalized goal ID appears in at least one `Covers` field.
+- [ ] Every question's `Decision unblocked` names a decision that is **genuinely open** — not determined by stable convention.
+- [ ] If `mode = initial`, every normalized goal ID either appears in at least one `Covers` field OR is explicitly excluded via the settled-by-convention rule.
 - [ ] If `mode = follow-up`, every still-material open question is covered by at least one new incremental question and no question materially duplicates the question ledger.
+- [ ] Batch size is proportionate to the number of genuinely open unknowns — a near-empty or empty batch is valid when the inventory is convention-covered.

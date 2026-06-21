@@ -1,15 +1,20 @@
 import { MAX_RESEARCH_REVIEW_ROUNDS, effectiveReviewRounds } from "../../domain/run/index.js";
+import { countBuiltinToolCalls, hashArtifactTexts, isNoEvidenceText } from "../../infra/pi/tool-usage.js";
 import type { ArtifactId, StageRuntime } from "../port/index.js";
 import {
   dispatchFailureSummary,
   dispatchLeaf,
   parseReviewStatus,
   readArtifact,
+  recordAnomaly,
   subStageContext,
   writeArtifact,
 } from "./utils.js";
 
 const RESEARCH_AGENT_TIMEOUT_MS = 600_000;
+
+/** Built-in tool names that dl-web-researcher is expected to call. */
+const WEB_RESEARCHER_TOOLS = ["websearch", "webfetch"] as const;
 
 interface ResearchQuestion {
   id: string;
@@ -24,7 +29,11 @@ export interface ResearchPassResult {
   reviewRounds: number;
   summary?: string;
   dispatchFailure?: boolean;
+  /** True when at least one web/hybrid question's research produced no usable evidence. */
+  noEvidence?: boolean;
 }
+
+type WriteResult = { ok: true; fileWritten: string; noEvidence: boolean } | { ok: false; summary: string };
 
 export async function runResearchPassSubstage(
   runtime: StageRuntime,
@@ -32,6 +41,10 @@ export async function runResearchPassSubstage(
 ): Promise<ResearchPassResult> {
   const filesWritten: string[] = [];
   const questions = parseQuestions(questionsMarkdown);
+
+  // Track which question IDs were flagged as no-evidence so rewrite dispatches
+  // can include an explicit corrective hint.
+  const noEvidenceIds = new Set<string>();
 
   for (const question of questions) {
     const result = await writeQuestionResearch(runtime, question);
@@ -45,6 +58,16 @@ export async function runResearchPassSubstage(
       };
     }
     filesWritten.push(result.fileWritten);
+    if (result.noEvidence) {
+      noEvidenceIds.add(question.id);
+      await recordAnomaly(
+        runtime,
+        "research-no-evidence",
+        "error",
+        `Web researcher for ${question.id} produced no usable evidence (inert markup or no URL references with zero tool calls).`,
+        { questionId: question.id, tag: question.tag },
+      );
+    }
   }
 
   // Pass artifact paths (relative to run dir) to the synthesizer agent.
@@ -65,6 +88,7 @@ export async function runResearchPassSubstage(
       reviewRounds: 0,
       summary: summaryFailure,
       dispatchFailure: true,
+      ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
     };
   }
   if (/### Status\s+[—-]\s+FAIL\b/m.test(summary.text)) {
@@ -72,6 +96,7 @@ export async function runResearchPassSubstage(
       status: "FAIL",
       filesWritten,
       reviewRounds: 0,
+      ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
     };
   }
   const summaryArtifactFailure = await ensureResearchSummaryArtifact(
@@ -86,12 +111,19 @@ export async function runResearchPassSubstage(
       reviewRounds: 0,
       summary: summaryArtifactFailure,
       dispatchFailure: true,
+      ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
     };
   }
 
   let reviewRounds = 1;
   const researchCtx = subStageContext(runtime);
   const researchMaxRounds = effectiveReviewRounds(runtime.services.gates.reviewDepth, MAX_RESEARCH_REVIEW_ROUNDS);
+
+  // Hash snapshot of artifacts at the start of the most recent round.
+  // Used to detect when a rewrite produced no change (no-progress guard).
+  // Checked after a FAIL verdict so a reviewer PASS in any round is never blocked.
+  let prevRoundArtifactHash: string | undefined = undefined;
+
   while (reviewRounds <= researchMaxRounds) {
     await runtime.services.telemetrySink.record({
       type: "review.round.started",
@@ -100,7 +132,11 @@ export async function runResearchPassSubstage(
       reviewRound: reviewRounds,
       maxRounds: researchMaxRounds,
     });
+
     const questionArtifacts = await readQuestionArtifacts(runtime, questions);
+    const summaryText = await readArtifact(runtime, { kind: "researchSummary" });
+    const currentHash = hashArtifactTexts([...questionArtifacts, summaryText]);
+
     const review = await dispatchLeaf(
       runtime,
       "dl-research-reviewer",
@@ -114,7 +150,7 @@ export async function runResearchPassSubstage(
           "",
         ]),
         "=== SUMMARY ===",
-        await readArtifact(runtime, { kind: "researchSummary" }),
+        summaryText,
       ].join("\n"),
       {
         tools: ["read", "bash", "grep", "find", "ls", "write", "edit"],
@@ -137,6 +173,7 @@ export async function runResearchPassSubstage(
         reviewRounds,
         summary: reviewFailure,
         dispatchFailure: true,
+        ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
       };
     }
 
@@ -166,20 +203,43 @@ export async function runResearchPassSubstage(
         status: "PASS",
         filesWritten,
         reviewRounds,
+        ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
       };
     }
+
+    // No-progress guard: if the reviewer FAILed AND the artifacts are identical to
+    // last round's pre-review state, the rewrite had no effect — stop early.
+    if (prevRoundArtifactHash !== undefined && currentHash === prevRoundArtifactHash) {
+      await recordAnomaly(
+        runtime,
+        "review-loop-no-progress",
+        "warning",
+        `Research review loop stopped early at round ${reviewRounds}/${researchMaxRounds}: artifacts unchanged after rewrite.`,
+        { round: reviewRounds, maxRounds: researchMaxRounds },
+      );
+      return {
+        status: "FAIL",
+        filesWritten,
+        reviewRounds,
+        ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
+      };
+    }
+    // Capture this round's hash so the next round can detect no-progress.
+    prevRoundArtifactHash = currentHash;
 
     if (reviewRounds === researchMaxRounds) {
       return {
         status: "FAIL",
         filesWritten,
         reviewRounds,
+        ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
       };
     }
 
     const questionsToRevise = questionsReferencedByReview(review.text, questions);
     for (const question of questionsToRevise) {
-      const result = await writeQuestionResearch(runtime, question, review.text);
+      const priorNoEvidence = noEvidenceIds.has(question.id);
+      const result = await writeQuestionResearch(runtime, question, review.text, priorNoEvidence);
       if (!result.ok) {
         return {
           status: "FAIL",
@@ -187,22 +247,22 @@ export async function runResearchPassSubstage(
           reviewRounds,
           summary: result.summary,
           dispatchFailure: true,
+          ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
         };
       }
       filesWritten.push(result.fileWritten);
+      if (result.noEvidence) {
+        noEvidenceIds.add(question.id);
+      } else {
+        // The rewrite produced real evidence — clear the flag for this question.
+        noEvidenceIds.delete(question.id);
+      }
     }
 
     const revisedSummary = await dispatchLeaf(
       runtime,
       "dl-research-synthesizer",
-      [
-        researchArtifactList,
-        "",
-        "=== REVIEW FEEDBACK ===",
-        review.text,
-        "",
-        "Revise `research/summary.md` to address every FAIL finding. Preserve only facts supported by the per-question artifacts.",
-      ].join("\n"),
+      buildSynthesizerRevisionPrompt(researchArtifactList, review.text, noEvidenceIds.size > 0),
       {
         tools: ["read", "bash", "grep", "find", "ls", "write", "edit"],
         timeoutMs: RESEARCH_AGENT_TIMEOUT_MS,
@@ -216,6 +276,7 @@ export async function runResearchPassSubstage(
         reviewRounds,
         summary: revisionFailure,
         dispatchFailure: true,
+        ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
       };
     }
     if (/### Status\s+[—-]\s+FAIL\b/m.test(revisedSummary.text)) {
@@ -223,6 +284,7 @@ export async function runResearchPassSubstage(
         status: "FAIL",
         filesWritten,
         reviewRounds,
+        ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
       };
     }
     const revisedSummaryArtifactFailure = await ensureResearchSummaryArtifact(
@@ -237,6 +299,7 @@ export async function runResearchPassSubstage(
         reviewRounds,
         summary: revisedSummaryArtifactFailure,
         dispatchFailure: true,
+        ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
       };
     }
 
@@ -247,6 +310,7 @@ export async function runResearchPassSubstage(
     status: "FAIL",
     filesWritten,
     reviewRounds,
+    ...(noEvidenceIds.size > 0 ? { noEvidence: true } : {}),
   };
 }
 
@@ -273,8 +337,11 @@ async function writeQuestionResearch(
   runtime: StageRuntime,
   question: ResearchQuestion,
   reviewFeedback?: string,
-): Promise<{ ok: true; fileWritten: string } | { ok: false; summary: string }> {
+  priorNoEvidence?: boolean,
+): Promise<WriteResult> {
   const findings: string[] = [];
+  let noEvidence = false;
+
   if (question.tag === "codebase" || question.tag === "hybrid") {
     const codebase = await dispatchLeaf(
       runtime,
@@ -293,10 +360,16 @@ async function writeQuestionResearch(
     }
     findings.push(codebase.text);
   }
+
   if (question.tag === "web" || question.tag === "hybrid") {
-    const web = await dispatchLeaf(runtime, "dl-web-researcher", buildResearcherPrompt(question, reviewFeedback), {
-      timeoutMs: RESEARCH_AGENT_TIMEOUT_MS,
-    });
+    const web = await dispatchLeaf(
+      runtime,
+      "dl-web-researcher",
+      buildResearcherPrompt(question, reviewFeedback, priorNoEvidence),
+      {
+        timeoutMs: RESEARCH_AGENT_TIMEOUT_MS,
+      },
+    );
     const webFailure = dispatchFailureSummary(
       web,
       `${reviewFeedback ? "Web research revision" : "Web research"} failed for ${question.id}`,
@@ -304,16 +377,30 @@ async function writeQuestionResearch(
     if (webFailure) {
       return { ok: false, summary: webFailure };
     }
+
+    // Detect no-evidence: inert markup in the text OR no URLs in the text AND
+    // zero built-in tool calls in the session transcript.
+    const toolCallCount = countBuiltinToolCalls(web.messages, [...WEB_RESEARCHER_TOOLS]);
+    noEvidence = isNoEvidenceText(web.text) || toolCallCount === 0;
     findings.push(web.text);
   }
 
   const qId: ArtifactId = { kind: "researchFile", name: `${question.id.toLowerCase()}.md` };
   await writeArtifact(runtime, qId, findings.join("\n\n"));
-  return { ok: true, fileWritten: runtime.services.artifactRepo.relPath(qId) };
+  return { ok: true, fileWritten: runtime.services.artifactRepo.relPath(qId), noEvidence };
 }
 
-function buildResearcherPrompt(question: ResearchQuestion, reviewFeedback?: string): string {
+function buildResearcherPrompt(question: ResearchQuestion, reviewFeedback?: string, priorNoEvidence?: boolean): string {
+  const noEvidenceHint = priorNoEvidence
+    ? [
+        "IMPORTANT: Your previous research attempt produced no usable findings. Your output contained literal tool-call markup instead of actual search results, or it lacked any URL references with zero websearch/webfetch calls.",
+        "You MUST call websearch or webfetch to retrieve real content. Quote actual fetched findings with source URLs before returning. Do not describe tool calls in prose.",
+        "",
+      ].join("\n")
+    : undefined;
+
   return [
+    noEvidenceHint,
     "=== QUESTION ===",
     question.block.trim(),
     "",
@@ -330,6 +417,24 @@ function buildResearcherPrompt(question: ResearchQuestion, reviewFeedback?: stri
   ]
     .filter((part): part is string => Boolean(part))
     .join("\n");
+}
+
+function buildSynthesizerRevisionPrompt(
+  researchArtifactList: string,
+  reviewText: string,
+  hasNoEvidence: boolean,
+): string {
+  const parts: string[] = [researchArtifactList, "", "=== REVIEW FEEDBACK ===", reviewText, ""];
+  if (hasNoEvidence) {
+    parts.push(
+      "NOTE: One or more per-question research artifacts may contain no usable evidence (empty or containing only literal tool-call markup). Summarize only facts explicitly present in the artifacts; do not infer or fabricate findings for empty artifacts.",
+      "",
+    );
+  }
+  parts.push(
+    "Revise `research/summary.md` to address every FAIL finding. Preserve only facts supported by the per-question artifacts.",
+  );
+  return parts.join("\n");
 }
 
 async function readQuestionArtifacts(runtime: StageRuntime, questions: ResearchQuestion[]): Promise<string[]> {

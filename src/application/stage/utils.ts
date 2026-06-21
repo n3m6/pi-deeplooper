@@ -187,7 +187,8 @@ export { parseReviewStatus, extractFixGuidance, parseMarkdownSections };
  * no trace in telemetry (e.g. empty parse results, vacuous done-checks, no-progress loops).
  *
  * Stable codes: design-slices-unparsed, slice-no-evidence, done-check-vacuous,
- * slice-plan-empty, backward-loop-no-progress, skeleton-scaffold-missing.
+ * slice-plan-empty, backward-loop-no-progress, skeleton-scaffold-missing,
+ * research-no-evidence, review-loop-no-progress.
  */
 export async function recordAnomaly(
   runtime: StageRuntime,

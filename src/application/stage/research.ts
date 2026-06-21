@@ -28,6 +28,7 @@ export const researchStage: StageModule = {
         telemetry: {
           review_rounds: researchPass.reviewRounds,
           ...(researchPass.dispatchFailure ? {} : { terminal_review_state: "unclean-cap" as const }),
+          ...(researchPass.noEvidence ? { no_evidence: true } : {}),
           child_agent_calls: {
             "dl-question-generator": 1,
             "dl-codebase-researcher": 1,
@@ -44,6 +45,7 @@ export const researchStage: StageModule = {
       telemetry: {
         review_rounds: Math.max(questions.reviewRounds, researchPass.reviewRounds),
         terminal_review_state: "clean",
+        ...(researchPass.noEvidence ? { no_evidence: true } : {}),
         child_agent_calls: {
           "dl-question-generator": 1,
           "dl-question-leakage-reviewer": 1,
