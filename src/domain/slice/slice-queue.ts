@@ -296,6 +296,23 @@ export class SliceQueue {
   }
 
   /**
+   * Returns true when the design is "tiny" — a single execution phase and at most 2 vertical
+   * slices. Used by the skeleton stage to decide whether a correct over-implementation should
+   * be accepted as a carry-forward rather than torn back down to stubs.
+   */
+  static isTinyProject(designMd: string): boolean {
+    const slices = parseDesignSlicesFromManifestOrHeadings(designMd);
+    if (slices.length > 2) return false;
+
+    // Count `### Phase` headings inside the `## Phases` section.
+    const topLevelSections = designMd.split(/^## /m);
+    const phasesSection = topLevelSections.find((s) => s.startsWith("Phases"));
+    if (!phasesSection) return true; // no explicit Phases section → treat as tiny
+    const phaseCount = (phasesSection.match(/^### Phase /gm) ?? []).length;
+    return phaseCount <= 1;
+  }
+
+  /**
    * Reconcile the queue after a Design/Goals escalation: rebuild from the new design
    * document but preserve any slices that are already "done" — unless their criterion
    * is in the provided `failingCriteria` set (meaning a downstream stage proved the

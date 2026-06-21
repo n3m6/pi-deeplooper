@@ -18,7 +18,15 @@ import { promisify } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { runPipeline } from "../../application/pipeline/run-pipeline.js";
-import type { PipelineServices, ProgressReporter, TelemetryEvent } from "../../application/port/index.js";
+import type {
+  DispatchRequest,
+  DispatchResult,
+  Dispatcher,
+  PipelineServices,
+  ProgressReporter,
+  StageOutcome,
+  TelemetryEvent,
+} from "../../application/port/index.js";
 import { Run } from "../../domain/run/index.js";
 import { FileSystemArtifactRepository, ensureRunDirectories, getRunArtifacts } from "../fs/artifact-repository.js";
 import { FileSystemRunStateRepository } from "../fs/state-repository.js";
@@ -154,6 +162,53 @@ class NoopProgressReporter implements ProgressReporter {
 }
 
 // ---------------------------------------------------------------------------
+// PostCassetteAgentFallback — canonical PASS mock for agents added after recording
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical mock responses for leaf agents added after existing cassettes were recorded.
+ * Keys are agent names; values are the text response to return.
+ */
+const POST_CASSETTE_AGENT_RESPONSES: Record<string, string> = {
+  "dl-skeleton-reviewer":
+    "### Status — PASS\nClassification: SCAFFOLD_OK\n\n### Fix Guidance\nNone.\n\n### Summary\nScaffold is correct.",
+};
+
+/**
+ * Dispatcher that handles agents introduced after an existing cassette was recorded.
+ * Used as a live-fallthrough so new dispatches appear in the event stream and goldens
+ * are regenerated without cassette re-recording.
+ */
+class PostCassetteAgentFallback implements Dispatcher {
+  dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    const name = request.target.kind === "leaf" ? request.target.name : undefined;
+    const response = name ? POST_CASSETTE_AGENT_RESPONSES[name] : undefined;
+    if (response !== undefined) {
+      return Promise.resolve({ text: response, messages: [], customToolCalls: [], endReason: "agent_end" });
+    }
+    return Promise.reject(
+      new Error(
+        `PostCassetteAgentFallback: no response for agent="${name ?? request.target.kind}" — add it to POST_CASSETTE_AGENT_RESPONSES or re-record the cassette.`,
+      ),
+    );
+  }
+
+  async dispatchParallel(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    return Promise.all(requests.map((r) => this.dispatch(r)));
+  }
+
+  async dispatchChain(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    const results: DispatchResult[] = [];
+    for (const r of requests) results.push(await this.dispatch(r));
+    return results;
+  }
+
+  dispatchGenericCoding(_prompt: string): Promise<StageOutcome> {
+    return Promise.reject(new Error("PostCassetteAgentFallback: generic dispatch must be handled by the cassette."));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // runReplay — main entry point
 // ---------------------------------------------------------------------------
 
@@ -184,7 +239,21 @@ export async function runReplay(options: { cassetteDir: string; mode: ReplayMode
 
   const replayGate = new ReplayGateManager(reader, meta.interactionMode, meta.failurePolicy, meta.reviewDepth);
 
-  const replayDispatcher = new ReplayDispatcher(reader, mode, workspaceRoot, meta.runId, applyPatch);
+  // Provide a fallback for leaf agents added after existing cassettes were recorded.
+  // These agents were not present during recording so there are no cassette entries for them.
+  // The fallback returns canonical PASS responses so the pipeline proceeds identically to the
+  // original run, with the new dispatch events appearing in the event stream (causing goldens
+  // to be regenerated once on the next run).
+  const postCassetteAgentFallback = new PostCassetteAgentFallback();
+  const replayDispatcher = new ReplayDispatcher(
+    reader,
+    mode,
+    workspaceRoot,
+    meta.runId,
+    applyPatch,
+    "live-fallthrough",
+    postCassetteAgentFallback,
+  );
 
   // Wrap GitVersionControl with StubChangesVersionControl so that changedFiles/changedLineCount
   // always return [] / 0, matching what FakeVersionControl returns in pure mode and what was

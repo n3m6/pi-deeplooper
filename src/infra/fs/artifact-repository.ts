@@ -33,6 +33,7 @@ export interface RunArtifacts {
   baselineResultsFile: string;
   stage9SummaryFile: string;
   stage10SummaryFile: string;
+  escalationGuidanceFile: string;
   eventsFile: string;
   runLogFile: string;
   metricsFile: string;
@@ -76,6 +77,7 @@ export function getRunArtifacts(workspaceRoot: string, runId: string): RunArtifa
     baselineResultsFile: path.join(runDir, "baseline-results.md"),
     stage9SummaryFile: path.join(runDir, "stage9-summary.md"),
     stage10SummaryFile: path.join(runDir, "stage10-summary.md"),
+    escalationGuidanceFile: path.join(runDir, "escalation-guidance.md"),
     eventsFile: path.join(telemetryDir, "events.jsonl"),
     runLogFile: path.join(telemetryDir, "run-log.md"),
     metricsFile: path.join(telemetryDir, "metrics-summary.md"),
@@ -158,6 +160,8 @@ export class FileSystemArtifactRepository implements ArtifactRepository {
         return p.stage9SummaryFile;
       case "stage10Summary":
         return p.stage10SummaryFile;
+      case "escalationGuidance":
+        return p.escalationGuidanceFile;
       case "taskSpec":
         return path.join(p.phasesDir, `phase-${String(id.phase).padStart(2, "0")}`, "tasks", `task-${id.taskId}.md`);
       case "phaseFile":

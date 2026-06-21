@@ -6,7 +6,7 @@ import { isOrchestrator, loadAgentDefinitions } from "../../src/infra/pi/agent-c
 test("loadAgentDefinitions returns retained markdown leaf agents only", async () => {
   const definitions = await loadAgentDefinitions();
 
-  assert.equal(definitions.size, 39); // 39 dl-* leaf agent files
+  assert.equal(definitions.size, 40); // 40 dl-* leaf agent files
   assert.ok(definitions.has("dl-goals-synthesizer"));
   assert.ok(definitions.has("dl-reporter"));
   assert.ok(!definitions.has("dl-goals"));

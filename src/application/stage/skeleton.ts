@@ -3,9 +3,14 @@
  * structure-mapper/reviewer review loop to produce structure.md.
  *
  * Resume behavior: early-PASS when structure.md already exists.
+ *
+ * Self-correction loop (MAX_SKELETON_REVIEW_ROUNDS):
+ *   build → dl-skeleton-reviewer → SCAFFOLD_OK (merge) | OVER_IMPLEMENTATION (repair/carry) | SCAFFOLD_BROKEN (escalate)
  */
 
-import { extractMarkdownDocument, parsePipeTable } from "../../infra/codec/markdown-codec.js";
+import { extractMarkdownDocument, extractFixGuidance, parsePipeTable } from "../../infra/codec/markdown-codec.js";
+import { SliceQueue } from "../../domain/slice/slice-queue.js";
+import { MAX_SKELETON_REVIEW_ROUNDS, effectiveReviewRounds } from "../../domain/run/index.js";
 import { runAgentReviewLoop } from "../workflow/agent-review-loop.js";
 import { runFastImplLoopSubstage } from "./fast-impl-loop.js";
 import type { StageModule, StageOutcome, StageRuntime } from "../port/index.js";
@@ -19,6 +24,18 @@ import {
   safeReadArtifact,
   writeArtifact,
 } from "./utils.js";
+
+/** Classification returned by dl-skeleton-reviewer. */
+type SkeletonClassification = "SCAFFOLD_OK" | "OVER_IMPLEMENTATION" | "SCAFFOLD_BROKEN";
+
+function parseSkeletonClassification(reviewText: string): SkeletonClassification {
+  const match = reviewText.match(/^Classification:\s*(SCAFFOLD_OK|OVER_IMPLEMENTATION|SCAFFOLD_BROKEN)\b/m);
+  const cls = match?.[1];
+  if (cls === "SCAFFOLD_OK") return "SCAFFOLD_OK";
+  if (cls === "OVER_IMPLEMENTATION") return "OVER_IMPLEMENTATION";
+  // Default to SCAFFOLD_BROKEN on parse failure — conservative: route to design, not a silent hard fail.
+  return "SCAFFOLD_BROKEN";
+}
 
 export const skeletonStage: StageModule = {
   stage: "skeleton",
@@ -58,7 +75,10 @@ export const skeletonStage: StageModule = {
     const requirements = await safeReadArtifact(runtime, { kind: "requirements" });
     const research = await safeReadArtifact(runtime, { kind: "researchSummary" });
 
-    // Write the skeleton task spec so dl-skeleton can read it.
+    // Detect tiny projects upfront so carry-forward logic is ready.
+    const tinyProject = SliceQueue.isTinyProject(design);
+
+    // Write the skeleton task spec so the coding worker can read it.
     const skeletonTaskContent = renderSkeletonTaskSpec({ goals, design, requirements, research });
     await writeArtifact(runtime, { kind: "skeletonTask" }, skeletonTaskContent);
 
@@ -66,27 +86,95 @@ export const skeletonStage: StageModule = {
     const repoRoot = await runtime.services.versionControl.resolveRepoRoot(signal);
     const worktree = await runtime.services.versionControl.prepareWorktree(0, "skeleton", repoRoot, signal);
 
-    try {
-      const implResult = await runFastImplLoopSubstage(runtime, {
-        taskId: "skeleton",
-        worktreeRoot: worktree.worktreeRoot,
-        taskSpecId: { kind: "skeletonTask" },
-      });
+    // Track whether the over-implementation carry-forward path was taken.
+    let carryForward = false;
+    // Count actual dl-skeleton-reviewer dispatches across all self-correction rounds.
+    let reviewerCallCount = 0;
 
-      if (implResult.status !== "PASS") {
+    try {
+      // -----------------------------------------------------------------------
+      // Bounded self-correction loop: build → dl-skeleton-reviewer → repair
+      // -----------------------------------------------------------------------
+      const maxRounds = effectiveReviewRounds(runtime.services.gates.reviewDepth, MAX_SKELETON_REVIEW_ROUNDS);
+      let repairGuidance: string | undefined = undefined;
+      let lastClassification: SkeletonClassification = "SCAFFOLD_BROKEN";
+      let lastImplStatus: StageOutcome["status"] = "FAIL";
+
+      for (let round = 1; round <= maxRounds; round++) {
+        const implResult = await runFastImplLoopSubstage(runtime, {
+          taskId: "skeleton",
+          worktreeRoot: worktree.worktreeRoot,
+          taskSpecId: { kind: "skeletonTask" },
+          ...(repairGuidance !== undefined ? { repairGuidance } : {}),
+        });
+        lastImplStatus = implResult.status;
+
+        // Dispatch dl-skeleton-reviewer (read-only) against the worktree regardless of implResult.
+        // It can classify whether the issue is structural (SCAFFOLD_BROKEN) or over-implementation.
+        const reviewerPrompt = buildSkeletonReviewerPrompt(worktree.worktreeRoot, goals, design, skeletonTaskContent);
+        const reviewResult = await dispatchLeaf(runtime, "dl-skeleton-reviewer", reviewerPrompt, {
+          cwd: worktree.worktreeRoot,
+          tools: ["read", "bash", "grep", "find", "ls"],
+        });
+
+        const reviewFailure = dispatchFailureSummary(reviewResult, "dl-skeleton-reviewer");
+        if (reviewFailure) {
+          // Infra failure — hard FAIL without a design loop (not design's fault).
+          return {
+            status: "FAIL",
+            filesWritten: ["skeleton-task.md"],
+            summary: `Skeleton reviewer dispatch failed: ${reviewFailure}`,
+          };
+        }
+        reviewerCallCount += 1;
+
+        lastClassification = parseSkeletonClassification(reviewResult.text);
+        const fixGuidance = extractFixGuidance(reviewResult.text);
+
+        if (lastClassification === "SCAFFOLD_OK") {
+          // Scaffold is correct stubs — proceed to merge.
+          break;
+        }
+
+        if (lastClassification === "OVER_IMPLEMENTATION") {
+          const implPassed = lastImplStatus === "PASS" || lastImplStatus === "PARTIAL";
+          if (tinyProject && implPassed) {
+            // Tiny project with working over-implementation: accept and carry forward.
+            carryForward = true;
+            break;
+          }
+          if (round < maxRounds) {
+            // Still have rounds left — give repair guidance and retry.
+            repairGuidance =
+              fixGuidance !== "None." && fixGuidance.trim()
+                ? fixGuidance
+                : `Over-implementation detected in round ${round}. Reduce source files to minimal stubs — no business logic.`;
+            continue;
+          }
+          // Exhausted local retries for over-implementation — hard FAIL (not design-rooted).
+          return {
+            status: "FAIL",
+            filesWritten: ["skeleton-task.md"],
+            summary: `Skeleton over-implementation could not be repaired after ${maxRounds} round(s). ${fixGuidance}`,
+          };
+        }
+
+        // SCAFFOLD_BROKEN — structural/config/build problem rooted in the design.
         return {
           status: "FAIL",
           filesWritten: ["skeleton-task.md"],
-          summary: `Skeleton build failed: ${implResult.summary}`,
+          summary: `Skeleton build failed; design needs revision. ${fixGuidance}`,
           backwardLoop: {
             classification: "LOOP_DESIGN",
             summary: "Skeleton build failed; design needs revision.",
-            guidance: implResult.summary,
+            guidance: fixGuidance !== "None." && fixGuidance.trim() ? fixGuidance : implResult.summary,
           },
         };
       }
 
-      // Commit and squash-merge the skeleton worktree.
+      // -----------------------------------------------------------------------
+      // Merge the worktree into the run branch (common to SCAFFOLD_OK and carry-forward).
+      // -----------------------------------------------------------------------
       const changed = await runtime.services.versionControl.changedFiles(worktree.worktreeRoot, signal);
       if (changed.length > 0) {
         await runtime.services.versionControl.commitWorktreeChanges(
@@ -107,14 +195,45 @@ export const skeletonStage: StageModule = {
           },
         };
       }
+
+      // -----------------------------------------------------------------------
+      // For SCAFFOLD_BROKEN detected after exhausting rounds (unreachable via the
+      // current loop but kept for safety): fallback return.
+      // Only executed when maxRounds = 0 or the loop exited without break/return
+      // via an unexpected path — treat as hard FAIL.
+      // -----------------------------------------------------------------------
+      if (lastClassification === "SCAFFOLD_BROKEN" && !carryForward) {
+        return {
+          status: "FAIL",
+          filesWritten: ["skeleton-task.md"],
+          summary: "Skeleton reviewer loop exhausted without a SCAFFOLD_OK verdict.",
+          backwardLoop: {
+            classification: "LOOP_DESIGN",
+            summary: "Skeleton could not reach a valid scaffold; design needs revision.",
+          },
+        };
+      }
     } finally {
       await runtime.services.versionControl.cleanupWorktree(worktree, signal).catch(() => {
         /* ignore cleanup failures */
       });
     }
 
+    // -----------------------------------------------------------------------
+    // Post-merge: write artifacts and run structure loop.
+    // -----------------------------------------------------------------------
+
+    // Carry-forward path: mark all design slices done so slice-loop skips them.
+    if (carryForward) {
+      let queue = SliceQueue.buildInitial(design);
+      for (const slice of queue.slices) {
+        queue = queue.markDone(slice.id);
+      }
+      await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
+    }
+
     // Write skeleton-results.md.
-    const skeletonResultsContent = renderSkeletonResults("PASS");
+    const skeletonResultsContent = renderSkeletonResults("PASS", carryForward ? "carry-forward" : undefined);
     await writeArtifact(runtime, { kind: "skeletonResults" }, skeletonResultsContent);
 
     // Run structure-mapper + structure-reviewer review loop.
@@ -191,22 +310,29 @@ export const skeletonStage: StageModule = {
     // Write stage7-summary.md inside the skeleton dir (via runFile).
     const stage7SummaryId = { kind: "runFile" as const, name: "skeleton/stage7-summary.md" };
     await writeArtifact(runtime, stage7SummaryId, renderStage7Summary());
+
+    const extraFiles = carryForward ? [artifactRelPath(runtime, { kind: "sliceQueue" })] : [];
     const filesWritten = [
       artifactRelPath(runtime, { kind: "skeletonTask" }),
       artifactRelPath(runtime, { kind: "skeletonResults" }),
       "structure.md",
       artifactRelPath(runtime, stage7SummaryId),
+      ...extraFiles,
       ...review.filesWritten,
     ];
 
     return {
       status: "PASS",
       filesWritten,
-      summary: "Skeleton built and structure.md approved.",
+      summary: carryForward
+        ? "Skeleton over-implementation accepted as carry-forward (tiny project). All slices marked done."
+        : "Skeleton built and structure.md approved.",
       telemetry: {
         review_rounds: review.reviewRounds,
         terminal_review_state: "clean",
+        ...(carryForward ? { deterministic_fast_path: "carry-forward-tiny" } : {}),
         child_agent_calls: {
+          "dl-skeleton-reviewer": reviewerCallCount,
           "dl-structure-mapper": 1,
           "dl-structure-reviewer": review.reviewRounds,
         },
@@ -253,12 +379,32 @@ function renderSkeletonTaskSpec(context: {
   ].join("\n");
 }
 
-function renderSkeletonResults(status: "PASS" | "FAIL"): string {
+function renderSkeletonResults(status: "PASS" | "FAIL", variant?: "carry-forward"): string {
+  const note =
+    variant === "carry-forward"
+      ? "Over-implementation accepted as carry-forward for tiny project. All vertical slices have been pre-marked done in slice-queue.md."
+      : "Directory structure, config files, and empty stubs are in place.";
+  return [`### Skeleton Status — ${status}`, "", "The skeleton build has completed.", note].join("\n");
+}
+
+function buildSkeletonReviewerPrompt(
+  worktreeRoot: string,
+  goals: string,
+  design: string,
+  skeletonTask: string,
+): string {
   return [
-    `### Skeleton Status — ${status}`,
+    "=== GOALS ===",
+    goals,
     "",
-    "The skeleton build has completed.",
-    "Directory structure, config files, and empty stubs are in place.",
+    "=== DESIGN ===",
+    design,
+    "",
+    "=== SKELETON TASK SPEC ===",
+    skeletonTask,
+    "",
+    "=== WORKTREE ROOT ===",
+    worktreeRoot,
   ].join("\n");
 }
 

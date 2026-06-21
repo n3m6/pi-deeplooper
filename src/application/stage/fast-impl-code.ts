@@ -9,6 +9,8 @@ export async function runFastImplCodeSubstage(
     worktreeRoot: string;
     taskSpecId: ArtifactId;
     attempt: number;
+    /** Corrective guidance from the previous attempt's verify failure, or from an outer review loop. */
+    repairGuidance?: string;
   },
 ): Promise<StageOutcome> {
   const taskSpec = await readArtifact(runtime, options.taskSpecId);
@@ -24,6 +26,7 @@ export async function runFastImplCodeSubstage(
       `Attempt: ${options.attempt}`,
       `Worktree root: ${options.worktreeRoot}`,
       acceptanceRepairContext,
+      ...(options.repairGuidance ? ["", "=== REPAIR GUIDANCE FROM PREVIOUS ATTEMPT ===", options.repairGuidance] : []),
       "",
       taskSpec,
       "",

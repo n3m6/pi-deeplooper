@@ -9,13 +9,22 @@ export async function runFastImplLoopSubstage(
     taskId: string;
     worktreeRoot: string;
     taskSpecId: ArtifactId;
+    /** Guidance from an outer review loop (e.g. skeleton reviewer) passed into the first code attempt. */
+    repairGuidance?: string;
   },
 ): Promise<StageOutcome> {
   let attempt = 1;
   let latestTelemetry = {};
+  // On the first attempt, carry any externally-provided guidance; on subsequent attempts, replace
+  // it with the previous attempt's verify failure so the worker knows exactly what to fix.
+  let currentRepairGuidance: string | undefined = options.repairGuidance;
 
   while (attempt <= 2) {
-    const code = await runFastImplCodeSubstage(runtime, { ...options, attempt });
+    const code = await runFastImplCodeSubstage(runtime, {
+      ...options,
+      attempt,
+      ...(currentRepairGuidance !== undefined ? { repairGuidance: currentRepairGuidance } : {}),
+    });
     if (code.status === "FAIL") {
       return code;
     }
@@ -45,6 +54,8 @@ export async function runFastImplLoopSubstage(
       };
     }
 
+    // Feed the verify failure into attempt 2 so the coding worker knows exactly what failed.
+    currentRepairGuidance = verify.summary;
     attempt += 1;
   }
 

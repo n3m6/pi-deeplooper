@@ -231,6 +231,10 @@ export class MockDispatcher implements Dispatcher {
       case "dl-design-reviewer":
       case "dl-structure-reviewer":
         return textResult("### Status — PASS\n\n### Summary\nPass.");
+      case "dl-skeleton-reviewer":
+        return textResult(
+          "### Status — PASS\nClassification: SCAFFOLD_OK\n\n### Fix Guidance\nNone.\n\n### Summary\nScaffold is correct.",
+        );
       case "dl-question-generator":
         return textResult(
           [

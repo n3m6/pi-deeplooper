@@ -167,6 +167,7 @@ export async function runPipeline(options: {
             ...stageCtx,
             classification: outcome.backwardLoop.classification,
             maxLoops: MAX_BACKWARD_LOOPS,
+            reason: "no-progress",
           });
           await services.stateRepo.save(run);
           break;
@@ -178,6 +179,7 @@ export async function runPipeline(options: {
             ...stageCtx,
             classification: outcome.backwardLoop.classification,
             maxLoops: MAX_BACKWARD_LOOPS,
+            reason: "cap",
           });
           await services.stateRepo.save(run);
           break;
@@ -186,6 +188,10 @@ export async function runPipeline(options: {
         const target = escalationTarget(outcome.backwardLoop.classification);
         run.incrementBackwardLoops();
         run.setLastBackwardLoopFingerprint(fingerprint);
+        // Persist escalation guidance so the target stage can incorporate it into its prompt.
+        if (outcome.backwardLoop.guidance) {
+          await services.artifactRepo.write({ kind: "escalationGuidance" }, outcome.backwardLoop.guidance);
+        }
         // Signal slice-loop to reconcile the queue when it re-enters after design.
         if (target === "design" || target === "goals") {
           run.setPendingReconcile(true);

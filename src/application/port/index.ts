@@ -101,7 +101,8 @@ export type SingletonArtifact =
   | "skeletonResults"
   | "globalAcceptanceResults"
   | "stage9Summary"
-  | "stage10Summary";
+  | "stage10Summary"
+  | "escalationGuidance";
 
 export type ArtifactId =
   | { kind: SingletonArtifact }

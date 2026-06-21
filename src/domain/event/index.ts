@@ -190,6 +190,8 @@ export interface BackwardLoopFailed {
   route: Route;
   classification: BackwardLoopClassification;
   maxLoops: number;
+  /** Reason for stopping: "cap" when MAX_BACKWARD_LOOPS was reached, "no-progress" when a fixed-point was detected. */
+  reason?: "cap" | "no-progress";
 }
 
 export interface CheckpointCreated {

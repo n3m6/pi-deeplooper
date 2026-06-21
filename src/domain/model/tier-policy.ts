@@ -25,6 +25,7 @@ export const AGENT_TIERS: Record<string, ModelTier> = {
   "dl-research-reviewer": "review",
   "dl-design-reviewer": "review",
   "dl-structure-reviewer": "review",
+  "dl-skeleton-reviewer": "review",
   "dl-feasibility-checker": "review",
   "dl-done-checker": "review",
   "dl-review-security": "review",

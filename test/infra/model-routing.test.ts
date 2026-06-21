@@ -13,8 +13,8 @@ import { ConfiguredModelPolicy } from "../../src/infra/pi/model-policy.js";
 // Tier map
 // ---------------------------------------------------------------------------
 
-test("AGENT_TIERS covers exactly 39 agents", () => {
-  assert.equal(Object.keys(AGENT_TIERS).length, 39);
+test("AGENT_TIERS covers exactly 40 agents", () => {
+  assert.equal(Object.keys(AGENT_TIERS).length, 40);
 });
 
 test("AGENT_TIERS has 7 architect agents", () => {
@@ -22,9 +22,9 @@ test("AGENT_TIERS has 7 architect agents", () => {
   assert.equal(architects.length, 7);
 });
 
-test("AGENT_TIERS has 22 review agents", () => {
+test("AGENT_TIERS has 23 review agents", () => {
   const reviewers = Object.values(AGENT_TIERS).filter((t) => t === "review");
-  assert.equal(reviewers.length, 22);
+  assert.equal(reviewers.length, 23);
 });
 
 test("AGENT_TIERS has 10 utility agents", () => {

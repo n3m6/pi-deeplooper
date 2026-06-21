@@ -1,6 +1,6 @@
 # DEEPLOOPER Agent Inventory
 
-This inventory tracks the deterministic TypeScript port of DEEPLOOPER. Orchestration logic lives in `src/application/` (the pipeline loop + stage modules); the 39 markdown leaf prompts in `agents/` remain as prompt payloads dispatched by the runtime.
+This inventory tracks the deterministic TypeScript port of DEEPLOOPER. Orchestration logic lives in `src/application/` (the pipeline loop + stage modules); the 40 markdown leaf prompts in `agents/` remain as prompt payloads dispatched by the runtime.
 
 - **Orchestrators → TypeScript** carried orchestration logic (`tools: subagent`) and were reimplemented as code; they have no markdown file in `agents/`.
 - **Leaf** agents remain as markdown prompts dispatched through the `Dispatcher` port.
@@ -27,7 +27,7 @@ This inventory tracks the deterministic TypeScript port of DEEPLOOPER. Orchestra
 
 The slice loop itself (`deeplooper`'s continuous queue loop) is implemented in `src/application/stage/slice-loop.ts`, with regression sub-orchestrators in `e2e-regression.ts` / `baseline-regression.ts`.
 
-## Leaf agents (39)
+## Leaf agents (40)
 
 `Tier` is the model-routing tier from `src/domain/model/tier-policy.ts`. `Wired` indicates whether the agent is currently dispatched by a stage (some leaves are carried verbatim from the spec but not yet wired into a stage).
 
@@ -47,6 +47,7 @@ The slice loop itself (`deeplooper`'s continuous queue loop) is implemented in `
 | `dl-design-reviewer` | Design | review | yes |
 | `dl-structure-mapper` | Skeleton | architect | yes |
 | `dl-structure-reviewer` | Skeleton | review | yes |
+| `dl-skeleton-reviewer` | Skeleton | review | yes |
 | `dl-baseline-checker` | Baseline | utility | yes |
 | `dl-slice-planner` | Slice Loop — planning | architect | yes |
 | `dl-feasibility-checker` | Slice Loop — feasibility | review | yes |
@@ -75,8 +76,8 @@ The slice loop itself (`deeplooper`'s continuous queue loop) is implemented in `
 
 Totals:
 
-- Leaf agents: 39
-- Currently wired: 34
+- Leaf agents: 40
+- Currently wired: 35
 - Carried but not yet wired: 5 (`dl-review-test-quality`, `dl-backward-loop-detector`, `dl-review-accept-spec`, `dl-review-accept-code-quality`, `dl-review-accept-goal-traceability`)
 
 The not-yet-wired leaves are kept verbatim from the DEEPLOOPER spec for parity. The slice loop currently derives backward-loop classification from the integration checker's output rather than dispatching `dl-backward-loop-detector`, and the global accept gate uses `dl-coverage-planner` + generic coding + `dl-reflector` rather than the per-criterion accept reviewers.

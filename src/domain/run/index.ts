@@ -27,6 +27,9 @@ export const MAX_ACCEPTANCE_ROUNDS = 3;
 /** Fast review mode caps every review loop to this many rounds (one correction cycle). */
 export const FAST_REVIEW_ROUNDS = 2;
 
+/** Maximum rounds for the skeleton reviewer self-correction loop (build → review → repair). */
+export const MAX_SKELETON_REVIEW_ROUNDS = 3;
+
 /**
  * Returns the effective number of review rounds for a loop.
  * In fast mode the cap is clamped to FAST_REVIEW_ROUNDS; in thorough mode the

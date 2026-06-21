@@ -242,8 +242,14 @@ function mapBackwardLoopEvent(event: BackwardLoopEvent): TelemetryEventPartial {
         event_type: "backward_loop.failed",
         status: "FAIL",
         ...base,
-        summary: `Backward-loop cap (${event.maxLoops}) reached; stopping the run.`,
-        context: { classification: event.classification },
+        summary:
+          event.reason === "no-progress"
+            ? "Backward loop made no progress (fixed point); stopping to avoid thrash."
+            : `Backward-loop cap (${event.maxLoops}) reached; stopping the run.`,
+        context: {
+          classification: event.classification,
+          ...(event.reason !== undefined ? { reason: event.reason } : {}),
+        },
       };
   }
 }
