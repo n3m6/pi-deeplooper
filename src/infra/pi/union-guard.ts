@@ -38,4 +38,5 @@ export const INTERVIEW_SOURCES = [
   "user-confirmed-finding",
   "automation-default",
   "automation-fallback",
+  "convention-default",
 ] as const;

@@ -13,7 +13,9 @@ export type InterviewEntrySource =
   | "repo-finding"
   | "user-confirmed-finding"
   | "automation-default"
-  | "automation-fallback";
+  | "automation-fallback"
+  /** Convention applied by the automated resolver with an explicit rationale. May back positive criteria. */
+  | "convention-default";
 
 export interface InterviewEntry {
   branch: string;
@@ -50,7 +52,7 @@ export const QUESTION_SET: InterviewQuestion[] = [
     branch: "non-goals",
     title: "Deeplooper: non-goals",
     question: "What is explicitly out of scope for this run?",
-    required: true,
+    required: false,
   },
   {
     branch: "acceptance-criteria",
@@ -62,7 +64,7 @@ export const QUESTION_SET: InterviewQuestion[] = [
     branch: "testing-expectations",
     title: "Deeplooper: testing expectations",
     question: "What tests or validation should be added or updated?",
-    required: true,
+    required: false,
   },
 ];
 

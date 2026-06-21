@@ -17,7 +17,7 @@ You are the Goals Reviewer. Review only the supplied artifacts; do not rewrite `
 
 ### Inputs
 
-Requirements (`requirements.md`), Interview Record (tagged `user-answer`, `user-confirmed-finding`, `repo-finding`, or `automation-default` entries), and Goals (`goals.md`).
+Requirements (`requirements.md`), Interview Record (tagged `user-answer`, `user-confirmed-finding`, `repo-finding`, `automation-default`, `automation-fallback`, or `convention-default` entries), and Goals (`goals.md`).
 
 ### Checks
 
@@ -31,9 +31,18 @@ Mark each area PASS or FAIL:
 - **Acceptance testability**: Every acceptance criterion is objectively verifiable; flag subjective terms like "fast", "clean", "easy", or "intuitive" unless translated into measurable conditions.
 - **Single-run scope**: Flag multiple independent subsystems or unrelated work tracks.
 - **Implicit assumptions**: Flag unstated assumptions required to implement or test the stated goals.
-- **Inference integrity**: Functional Requirements, Constraints, and Acceptance Criteria must trace to `user-answer` or `user-confirmed-finding`; flag any that trace only to `repo-finding` or to positive `automation-default` content.
+- **Inference integrity**: Functional Requirements, Constraints, and Acceptance Criteria must trace to an acceptable source (see table below). Flag any that trace only to a disallowed source.
 
-`automation-default` may justify only `None specified.` sections and conservative route handling. Treat any positive Functional Requirement, Constraint, or Acceptance Criterion derived only from `automation-default` as a FAIL.
+**Inference integrity source table:**
+
+| Source | May back positive FR / Constraint / AC? | Condition |
+|---|---|---|
+| `user-answer` | Yes | Always |
+| `user-confirmed-finding` | Yes | Always |
+| `convention-default` | Yes | The criterion's `content` must include an explicit rationale AND the criterion must be objectively verifiable. Flag if rationale is absent or the criterion is subjective. |
+| `repo-finding` | No | May inform Intent or Technical Specification only. |
+| `automation-default` | No | May justify `None specified.` sections only. |
+| `automation-fallback` | No | May justify `None specified.` sections only. |
 
 ### Rules
 

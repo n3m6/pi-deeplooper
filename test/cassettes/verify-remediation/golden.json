@@ -3,6 +3,8 @@
   "stage.started",
   "dispatch.started",
   "dispatch.completed",
+  "dispatch.started",
+  "dispatch.completed",
   "review.round.started",
   "dispatch.started",
   "dispatch.completed",

@@ -259,6 +259,23 @@ function noopProgress(): ProgressReporter {
   };
 }
 
+test("automated mode dispatches interviewer in convention mode and produces clean PASS", async () => {
+  await withWorkspace(async ({ runtime }) => {
+    const dispatcher = new ConventionGoalsDispatcher();
+    const outcome = await goalsStage.run({
+      ...runtime,
+      services: { ...runtime.services, dispatcher },
+    });
+
+    assert.ok(
+      dispatcher.dispatched.includes("dl-goals-interviewer"),
+      "expected dl-goals-interviewer to be dispatched for the convention pass",
+    );
+    assert.equal(outcome.status, "PASS");
+    assert.equal(outcome.route, "full");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Helpers for interactive interview tests
 // ---------------------------------------------------------------------------
@@ -290,7 +307,11 @@ function interactiveGates(failurePolicy: "fail-closed" | "best-effort" = "fail-c
 
 async function invokeInterviewReturn(
   request: DispatchRequest,
-  branches: Array<{ branch: string; source: "user-answer" | "automation-fallback"; content: string }>,
+  branches: Array<{
+    branch: string;
+    source: "user-answer" | "automation-fallback" | "convention-default";
+    content: string;
+  }>,
 ): Promise<DispatchResult> {
   const calls: Array<{ name: string; result: CustomToolResult }> = [];
   const tool = request.customTools?.find((c) => c.name === "interview_return");
@@ -300,6 +321,54 @@ async function invokeInterviewReturn(
     calls.push({ name: "interview_return", result });
   }
   return { text: "", messages: [], customToolCalls: calls };
+}
+
+/**
+ * Dispatcher that handles the automated convention pass and produces a clean PASS.
+ * The convention interviewer returns rationale-backed entries; synthesizer and reviewer PASS.
+ */
+class ConventionGoalsDispatcher implements Dispatcher {
+  readonly dispatched: string[] = [];
+
+  async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+    if (request.target.kind !== "leaf") return textResult("");
+    this.dispatched.push(request.target.name);
+    switch (request.target.name) {
+      case "dl-goals-interviewer":
+        return invokeInterviewReturn(request, [
+          {
+            branch: "constraints",
+            source: "convention-default",
+            content: "TypeScript strict compilation by convention — standard for typed Express projects.",
+          },
+          {
+            branch: "acceptance-criteria",
+            source: "convention-default",
+            content: "GET /health returns HTTP 200 — the universal monitoring convention for health endpoints.",
+          },
+        ]);
+      case "dl-goals-synthesizer":
+        return invokeGoalsReturn(request, "full");
+      case "dl-goals-reviewer":
+        return textResult("### Status — PASS\n\n### Summary\nAll checks pass.");
+      default:
+        return textResult("");
+    }
+  }
+
+  async dispatchParallel(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    return Promise.all(requests.map((r) => this.dispatch(r)));
+  }
+
+  async dispatchChain(requests: DispatchRequest[]): Promise<DispatchResult[]> {
+    const results: DispatchResult[] = [];
+    for (const r of requests) results.push(await this.dispatch(r));
+    return results;
+  }
+
+  async dispatchGenericCoding() {
+    return { status: "FAIL" as const, filesWritten: [], summary: "not used" };
+  }
 }
 
 /** Dispatcher that handles interviewer + synthesizer + reviewer for interactive tests. */

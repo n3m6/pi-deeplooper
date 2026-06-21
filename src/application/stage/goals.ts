@@ -103,6 +103,8 @@ export const goalsStage: StageModule = {
       // 2. Run agent review loop
       const interviewRecord = renderInterviewRecord(interview.entries);
       const requirements = await readArtifact(runtime, { kind: "requirements" });
+      // Accumulates every reviewer finding so the synthesizer can satisfy all rounds simultaneously.
+      const reviewHistory: string[] = [];
       const review = await runAgentReviewLoop(runtime, {
         maxRounds: MAX_GOALS_REVIEW_ROUNDS,
         stageName: "goals",
@@ -127,29 +129,32 @@ export const goalsStage: StageModule = {
           return { text: result.text };
         },
         onFail: async (reviewText) => {
-          const rewritten = await dispatchLeaf(
-            runtime,
-            "dl-goals-synthesizer",
-            [
-              "=== RUN ID ===",
-              runtime.state.runId,
+          // Capture prior rounds before appending the current one.
+          const priorHistory = [...reviewHistory];
+          reviewHistory.push(reviewText);
+
+          const prompt: string[] = [
+            "=== RUN ID ===",
+            runtime.state.runId,
+            "",
+            "=== USER TASK ===",
+            runtime.state.userTask ?? requirements,
+            "",
+            "=== INTERVIEW RECORD ===",
+            interviewRecord,
+          ];
+          if (priorHistory.length > 0) {
+            prompt.push(
               "",
-              "=== USER TASK ===",
-              runtime.state.userTask ?? requirements,
-              "",
-              "=== INTERVIEW RECORD ===",
-              interviewRecord,
-              "",
-              "=== REVIEW FEEDBACK ===",
-              reviewText,
-            ].join("\n"),
-            {
-              customTools: [
-                runtime.services.gates.createAskHumanTool(),
-                runtime.services.gates.createGoalsReturnTool(),
-              ],
-            },
-          );
+              "=== FEEDBACK HISTORY ===",
+              priorHistory.map((text, i) => `## Review Round ${i + 1}\n${text}`).join("\n\n"),
+            );
+          }
+          prompt.push("", "=== REVIEW FEEDBACK ===", reviewText);
+
+          const rewritten = await dispatchLeaf(runtime, "dl-goals-synthesizer", prompt.join("\n"), {
+            customTools: [runtime.services.gates.createAskHumanTool(), runtime.services.gates.createGoalsReturnTool()],
+          });
           const rewriteFailure = dispatchFailureSummary(rewritten, "Goals rewrite failed");
           if (rewriteFailure) return { failure: rewriteFailure, transient: isTransientDispatchFailure(rewritten) };
           const rewriteReturn = readGoalsReturn(rewritten);
@@ -360,19 +365,13 @@ async function collectInterview(
     return { entries };
   }
 
-  // Automated mode: apply defaults in code; no agent dispatch.
+  // Automated mode: dispatch the interviewer in convention mode (no ask_human tool).
+  // The agent explores the repo and applies stable ecosystem conventions, returning
+  // convention-default (with explicit rationale) or repo-finding entries.
+  // Branches still unresolved after the pass are filled with automation-fallback
+  // (best-effort) or fail the run (fail-closed).
   if (runtime.services.gates.interactionMode !== "interactive") {
-    for (const question of unresolved) {
-      if (runtime.services.gates.failurePolicy === "fail-closed" && question.required) {
-        return { failure: `Goals interview could not resolve the required branch "${question.branch}".` };
-      }
-      entries.push({
-        branch: question.branch,
-        source: "automation-fallback",
-        content: "Unresolved; proceed conservatively.",
-      });
-    }
-    return { entries };
+    return collectInterviewConventionPass(runtime, userTask, entries, unresolved);
   }
 
   // Interactive mode: dispatch the interviewer agent to resolve remaining branches.
@@ -440,6 +439,119 @@ async function collectInterview(
   }
 
   return { entries: merged };
+}
+
+/**
+ * Runs the convention pass for automated mode: dispatches dl-goals-interviewer with
+ * RESOLUTION MODE=convention (no ask_human), merges the returned entries, and fills
+ * any still-unresolved required branches per the failure policy.
+ */
+async function collectInterviewConventionPass(
+  runtime: StageRuntime,
+  userTask: string,
+  entries: InterviewEntry[],
+  unresolved: ReturnType<typeof unresolvedRequiredBranches>,
+): Promise<{ entries: InterviewEntry[] } | { failure: string }> {
+  const alreadyResolved = entries.filter((e) => e.branch !== "user-task");
+  const prompt = buildConventionInterviewerPrompt(runtime, userTask, alreadyResolved, unresolved);
+
+  let conventionResult = await dispatchLeaf(runtime, "dl-goals-interviewer", prompt, {
+    customTools: [runtime.services.gates.createInterviewReturnTool()],
+  });
+  for (
+    let attempt = 1;
+    attempt <= MAX_TRANSIENT_DISPATCH_RETRIES && isTransientDispatchFailure(conventionResult);
+    attempt++
+  ) {
+    conventionResult = await dispatchLeaf(runtime, "dl-goals-interviewer", prompt, {
+      customTools: [runtime.services.gates.createInterviewReturnTool()],
+    });
+  }
+
+  const agentEntries = readInterviewReturn(conventionResult);
+  const dispatchErr = dispatchFailureSummary(conventionResult, "Goals convention pass failed");
+
+  if (!agentEntries || dispatchErr) {
+    if (runtime.services.gates.failurePolicy === "fail-closed") {
+      return { failure: dispatchErr ?? "Goals convention pass did not call interview_return." };
+    }
+    // best-effort: fill unresolved branches with fallbacks.
+    for (const question of unresolved) {
+      entries.push({
+        branch: question.branch,
+        source: "automation-fallback",
+        content: "Unresolved; proceed conservatively.",
+      });
+    }
+    return { entries };
+  }
+
+  // Merge: pre-pass entries take precedence; convention entries fill unresolved branches.
+  const merged = [...entries];
+  for (const agentEntry of agentEntries) {
+    if (!merged.some((e) => e.branch === agentEntry.branch)) {
+      merged.push(agentEntry);
+    }
+  }
+
+  // Fill any still-unresolved required branches per failure policy.
+  const stillUnresolved = unresolvedRequiredBranches(merged);
+  if (stillUnresolved.length > 0) {
+    if (runtime.services.gates.failurePolicy === "fail-closed") {
+      return {
+        failure: `Convention pass could not resolve required branch(es): ${stillUnresolved.map((q) => q.branch).join(", ")}.`,
+      };
+    }
+    for (const question of stillUnresolved) {
+      merged.push({
+        branch: question.branch,
+        source: "automation-fallback",
+        content: "Unresolved; proceed conservatively.",
+      });
+    }
+  }
+
+  return { entries: merged };
+}
+
+function buildConventionInterviewerPrompt(
+  runtime: StageRuntime,
+  userTask: string,
+  resolvedEntries: InterviewEntry[],
+  unresolvedBranches: ReturnType<typeof unresolvedRequiredBranches>,
+): string {
+  const lines: string[] = [
+    "=== RUN ID ===",
+    runtime.state.runId,
+    "",
+    "=== USER TASK ===",
+    userTask,
+    "",
+    "=== RESOLUTION MODE ===",
+    "convention",
+    "",
+    "=== FAILURE POLICY ===",
+    runtime.services.gates.failurePolicy,
+    "",
+  ];
+
+  if (resolvedEntries.length > 0) {
+    lines.push(
+      "=== ALREADY RESOLVED BRANCHES ===",
+      "These branches were pre-resolved from the task text. Do not re-resolve them.",
+      renderInterviewRecord(resolvedEntries),
+      "",
+    );
+  }
+
+  lines.push(
+    "=== UNRESOLVED BRANCHES ===",
+    "Resolve these branches by exploring the repository and applying stable ecosystem conventions.",
+    "Do NOT call ask_human. Tag entries as convention-default (include explicit rationale in content) or repo-finding.",
+    ...unresolvedBranches.map((q) => `- ${q.branch}: ${q.question}`),
+  );
+
+  return lines.join("\n");
 }
 
 function buildInterviewerPrompt(

@@ -370,7 +370,8 @@ function normalizeInterviewSource(value: unknown): InterviewEntrySource {
     value === "repo-finding" ||
     value === "user-confirmed-finding" ||
     value === "automation-default" ||
-    value === "automation-fallback"
+    value === "automation-fallback" ||
+    value === "convention-default"
     ? value
     : "automation-fallback";
 }
