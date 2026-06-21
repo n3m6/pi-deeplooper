@@ -277,10 +277,11 @@ export class MockDispatcher implements Dispatcher {
         );
       case "dl-slice-planner": {
         if (!this.options.slicePlannerWritesNoTasks) {
-          const phaseDir = request.prompt.match(/=== PHASE DIR ===\n(.+)/)?.[1]?.trim() ?? "phases/phase-01";
-          const phaseSegment = phaseDir.split("/").at(-1) ?? "phase-01";
+          // Mirror real agent behaviour: resolve PHASE DIR relative to workspaceRoot (the dispatch cwd).
+          const phaseDir =
+            request.prompt.match(/=== PHASE DIR ===\n(.+)/)?.[1]?.trim() ?? `.pipeline/test-run/phases/phase-01`;
           const sliceId = request.prompt.match(/=== SLICE ID ===\n(.+)/)?.[1]?.trim() ?? "S1";
-          const tasksDir = path.join(this.artifacts.phasesDir, phaseSegment, "tasks");
+          const tasksDir = path.join(this.artifacts.workspaceRoot, phaseDir, "tasks");
           await mkdir(tasksDir, { recursive: true });
           await writeFile(path.join(tasksDir, "task-01.md"), renderSliceTaskSpec("01", sliceId, "1"), "utf8");
         }

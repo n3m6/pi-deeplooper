@@ -354,6 +354,11 @@ async function runSlicePlan(
   const design = await safeReadArtifact(runtime, { kind: "design" });
   const structure = await safeReadArtifact(runtime, { kind: "structure" });
 
+  // Build the cwd-relative path the agent should write to. The agent runs with
+  // cwd = workspaceRoot, so prefix the run dir so writes land in the run's phases
+  // tree — exactly where listTaskSpecs scans.
+  const runRelativePhaseDir = `.pipeline/${runtime.state.runId}/${phaseDir}`;
+
   const result = await dispatchLeaf(
     runtime,
     "dl-slice-planner",
@@ -361,7 +366,7 @@ async function runSlicePlan(
       `=== RUN ID ===\n${runtime.state.runId}`,
       `=== SLICE ID ===\n${sliceId}`,
       `=== SLICE TITLE ===\n${sliceTitle}`,
-      `=== PHASE DIR ===\n${phaseDir}`,
+      `=== PHASE DIR ===\n${runRelativePhaseDir}`,
       `=== ACCEPTANCE CRITERIA ===\n${acceptanceCriteria.join("\n")}`,
       `=== REQUEUE COUNT ===\n${requeueCount}`,
       `=== REQUEUE REASON ===\n${lastReason ?? "None."}`,
@@ -394,7 +399,7 @@ async function runSlicePlan(
       runtime,
       "slice-plan-empty",
       "error",
-      `dl-slice-planner returned PASS but wrote no task specs into ${phaseDir}/tasks/.`,
+      `dl-slice-planner returned PASS but wrote no task specs into ${runRelativePhaseDir}/tasks/.`,
       { sliceId, phase },
     );
     return { type: "requeue", reason: "Slice planner produced no task specs." };

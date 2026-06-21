@@ -1,6 +1,7 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
+import { access, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 import { sliceLoopStage } from "../../src/application/stage/slice-loop.js";
 import type { TelemetryEvent } from "../../src/application/port/index.js";
@@ -77,6 +78,13 @@ test("slice-loop: planner writes task spec, queue exhausts to PASS", async () =>
 
   assert.equal(result.status, "PASS");
   assert.match(result.summary, /exhausted/i);
+
+  // Pin the write-location contract: task spec must land in the run dir, not workspace root.
+  const correctPath = path.join(harness.artifacts.phasesDir, "phase-01", "tasks", "task-01.md");
+  await assert.doesNotReject(access(correctPath), `task-01.md not found in run dir: ${correctPath}`);
+
+  const wrongPath = path.join(harness.workspaceRoot, "phases", "phase-01", "tasks", "task-01.md");
+  await assert.rejects(access(wrongPath), `task-01.md must NOT exist at workspace root: ${wrongPath}`);
 });
 
 // ---------------------------------------------------------------------------
