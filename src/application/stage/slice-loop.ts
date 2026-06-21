@@ -22,11 +22,19 @@
 import { SliceQueue } from "../../domain/slice/slice-queue.js";
 import { Run, MAX_REQUEUE } from "../../domain/run/index.js";
 import { parseMarkdownSections, parseReviewStatus } from "../../infra/codec/markdown-codec.js";
-import type { StageModule, StageOutcome, StageRuntime } from "../port/index.js";
+import type { BackwardLoopRequest, StageModule, StageOutcome, StageRuntime } from "../port/index.js";
 import { runSliceImplementation } from "./implement.js";
 import { appendReflectorSection, dispatchLeaf, safeReadArtifact, writeArtifact } from "./utils.js";
 
 const REQUEUE_CAP = MAX_REQUEUE;
+
+// Mutable context threaded through slice-step helpers.
+interface SliceLoopCtx {
+  runtime: StageRuntime;
+  queue: SliceQueue;
+  run: Run;
+  filesWritten: string[];
+}
 
 export const sliceLoopStage: StageModule = {
   stage: "slice-loop",
@@ -53,9 +61,9 @@ export const sliceLoopStage: StageModule = {
         await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
 
         // Clear the pending-reconcile flag in the run aggregate.
-        const run = Run.rehydrate(state);
-        run.setPendingReconcile(false);
-        await runtime.services.stateRepo.save(run);
+        const reconcileRun = Run.rehydrate(state);
+        reconcileRun.setPendingReconcile(false);
+        await runtime.services.stateRepo.save(reconcileRun);
       }
     } else {
       // First entry: build the queue from design.md + skeleton-results.md.
@@ -66,23 +74,22 @@ export const sliceLoopStage: StageModule = {
     }
 
     const filesWritten: string[] = ["slice-queue.md"];
+    const ctx: SliceLoopCtx = { runtime, queue, run: Run.rehydrate(state), filesWritten };
 
     // -----------------------------------------------------------------------
     // Main slice execution loop
     // -----------------------------------------------------------------------
-    const run = Run.rehydrate(state);
-
     while (true) {
-      const slice = queue.selectNextReady();
+      const slice = ctx.queue.selectNextReady();
       if (!slice) {
         break;
       }
 
       // Mark building in both queue and run state.
-      queue = queue.markBuilding(slice.id);
-      run.markSliceBuilding(slice.id);
-      await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-      await runtime.services.stateRepo.save(run);
+      ctx.queue = ctx.queue.markBuilding(slice.id);
+      ctx.run.markSliceBuilding(slice.id);
+      await writeArtifact(runtime, { kind: "sliceQueue" }, ctx.queue.serialize());
+      await runtime.services.stateRepo.save(ctx.run);
 
       await sink.record({
         type: "slice.started",
@@ -94,76 +101,35 @@ export const sliceLoopStage: StageModule = {
       // Parse phase number from phaseDir (e.g. "phases/phase-01" → 1).
       const phaseMatch = slice.phaseDir.match(/phase-(\d+)$/);
       const phase = phaseMatch ? parseInt(phaseMatch[1] ?? "1", 10) : 1;
+
       // 1. dl-slice-planner — writes task specs.
       // (artifact-repository.write auto-creates parent directories on first write)
       const sliceOutcome = await runSlicePlan(runtime, phase, slice.id, slice.title, slice.acceptanceCriteria);
       if (sliceOutcome.type === "escalate") {
-        queue = queue.escalate(slice.id, sliceOutcome.reason);
-        run.escalateSlice(slice.id);
-        await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-        await runtime.services.stateRepo.save(run);
-        return {
-          status: "FAIL",
-          filesWritten,
+        return escalateSlice(ctx, slice.id, sliceOutcome.reason, {
+          classification: sliceOutcome.classification ?? "LOOP_DESIGN",
           summary: sliceOutcome.reason,
-          backwardLoop: {
-            classification: sliceOutcome.classification ?? "LOOP_DESIGN",
-            summary: sliceOutcome.reason,
-          },
-        };
+        });
       }
       if (sliceOutcome.type === "requeue") {
-        const requeueCount = (run.state.requeueCounts[slice.id] ?? 0) + 1;
-        if (requeueCount > REQUEUE_CAP) {
-          // Cap exceeded — escalate.
-          queue = queue.escalate(slice.id, sliceOutcome.reason);
-          run.escalateSlice(slice.id);
-          await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-          await runtime.services.stateRepo.save(run);
-          await sink.record({ type: "requeue.exhausted", route: state.route, sliceId: slice.id, requeueCount });
-          return {
-            status: "FAIL",
-            filesWritten,
-            summary: `Slice ${slice.id} escalated after ${requeueCount} requeue attempts: ${sliceOutcome.reason}`,
-            backwardLoop: { classification: "LOOP_DESIGN", summary: sliceOutcome.reason },
-          };
-        }
-        queue = queue.requeue(slice.id, sliceOutcome.reason);
-        run.requeueSlice(slice.id);
-        await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-        await runtime.services.stateRepo.save(run);
-        await sink.record({ type: "requeue.decided", route: state.route, sliceId: slice.id, requeueCount });
+        const outcome = await requeueOrEscalate(ctx, slice.id, sliceOutcome.reason, {
+          buildExhaustedSummary: (count) =>
+            `Slice ${slice.id} escalated after ${count} requeue attempts: ${sliceOutcome.reason}`,
+          requeueEvent: "decided",
+        });
+        if (outcome) return outcome;
         continue;
       }
 
       // 2. dl-feasibility-checker — read-only; controller writes feasibility-results.md.
       const feasibilityOutcome = await runFeasibilityCheck(runtime, phase, slice.id, slice.acceptanceCriteria);
       if (feasibilityOutcome.type === "requeue") {
-        const requeueCount = (run.state.requeueCounts[slice.id] ?? 0) + 1;
-        if (requeueCount > REQUEUE_CAP) {
-          queue = queue.escalate(slice.id, feasibilityOutcome.reason);
-          run.escalateSlice(slice.id);
-          await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-          await runtime.services.stateRepo.save(run);
-          await sink.record({ type: "requeue.exhausted", route: state.route, sliceId: slice.id, requeueCount });
-          return {
-            status: "FAIL",
-            filesWritten,
-            summary: `Slice ${slice.id} feasibility failed ${requeueCount} times: ${feasibilityOutcome.reason}`,
-            backwardLoop: { classification: "LOOP_DESIGN", summary: feasibilityOutcome.reason },
-          };
-        }
-        queue = queue.requeue(slice.id, feasibilityOutcome.reason);
-        run.requeueSlice(slice.id);
-        await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-        await runtime.services.stateRepo.save(run);
-        await sink.record({
-          type: "requeue.requested",
-          route: state.route,
-          sliceId: slice.id,
-          reason: feasibilityOutcome.reason,
-          requeueCount,
+        const outcome = await requeueOrEscalate(ctx, slice.id, feasibilityOutcome.reason, {
+          buildExhaustedSummary: (count) =>
+            `Slice ${slice.id} feasibility failed ${count} times: ${feasibilityOutcome.reason}`,
+          requeueEvent: "requested",
         });
+        if (outcome) return outcome;
         continue;
       }
       filesWritten.push(`${slice.phaseDir}/feasibility-results.md`);
@@ -178,44 +144,15 @@ export const sliceLoopStage: StageModule = {
           const classification = implOutcome.backwardLoop.classification;
           if (classification === "LOOP_DESIGN" || classification === "LOOP_GOALS") {
             // Escalate to pipeline level.
-            queue = queue.escalate(slice.id, implOutcome.summary);
-            run.escalateSlice(slice.id);
-            await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-            await runtime.services.stateRepo.save(run);
-            return {
-              status: "FAIL",
-              filesWritten,
-              summary: implOutcome.summary,
-              backwardLoop: implOutcome.backwardLoop,
-            };
+            return escalateSlice(ctx, slice.id, implOutcome.summary, implOutcome.backwardLoop);
           }
         }
         // LOCAL_SLICE or plain FAIL — requeue.
-        const requeueCount = (run.state.requeueCounts[slice.id] ?? 0) + 1;
-        if (requeueCount > REQUEUE_CAP) {
-          queue = queue.escalate(slice.id, implOutcome.summary);
-          run.escalateSlice(slice.id);
-          await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-          await runtime.services.stateRepo.save(run);
-          await sink.record({ type: "requeue.exhausted", route: state.route, sliceId: slice.id, requeueCount });
-          return {
-            status: "FAIL",
-            filesWritten,
-            summary: `Slice ${slice.id} escalated after ${requeueCount} requeue attempts.`,
-            backwardLoop: { classification: "LOOP_DESIGN", summary: implOutcome.summary },
-          };
-        }
-        queue = queue.requeue(slice.id, implOutcome.summary);
-        run.requeueSlice(slice.id);
-        await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-        await runtime.services.stateRepo.save(run);
-        await sink.record({
-          type: "requeue.requested",
-          route: state.route,
-          sliceId: slice.id,
-          reason: implOutcome.summary,
-          requeueCount,
+        const outcome = await requeueOrEscalate(ctx, slice.id, implOutcome.summary, {
+          buildExhaustedSummary: (count) => `Slice ${slice.id} escalated after ${count} requeue attempts.`,
+          requeueEvent: "requested",
         });
+        if (outcome) return outcome;
         continue;
       }
 
@@ -223,31 +160,11 @@ export const sliceLoopStage: StageModule = {
       const doneCheck = await runDoneCheck(runtime, phase, slice.id, slice.acceptanceCriteria);
       filesWritten.push(`${slice.phaseDir}/done-check-results.md`);
       if (doneCheck.status === "FAIL") {
-        const requeueCount = (run.state.requeueCounts[slice.id] ?? 0) + 1;
-        if (requeueCount > REQUEUE_CAP) {
-          queue = queue.escalate(slice.id, doneCheck.reason);
-          run.escalateSlice(slice.id);
-          await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-          await runtime.services.stateRepo.save(run);
-          await sink.record({ type: "requeue.exhausted", route: state.route, sliceId: slice.id, requeueCount });
-          return {
-            status: "FAIL",
-            filesWritten,
-            summary: `Slice ${slice.id} done-check failed ${requeueCount} times: ${doneCheck.reason}`,
-            backwardLoop: { classification: "LOOP_DESIGN", summary: doneCheck.reason },
-          };
-        }
-        queue = queue.requeue(slice.id, doneCheck.reason);
-        run.requeueSlice(slice.id);
-        await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-        await runtime.services.stateRepo.save(run);
-        await sink.record({
-          type: "requeue.requested",
-          route: state.route,
-          sliceId: slice.id,
-          reason: doneCheck.reason,
-          requeueCount,
+        const outcome = await requeueOrEscalate(ctx, slice.id, doneCheck.reason, {
+          buildExhaustedSummary: (count) => `Slice ${slice.id} done-check failed ${count} times: ${doneCheck.reason}`,
+          requeueEvent: "requested",
         });
+        if (outcome) return outcome;
         continue;
       }
 
@@ -256,10 +173,10 @@ export const sliceLoopStage: StageModule = {
       filesWritten.push("lessons.md", "spec-history.md");
 
       // Mark done.
-      queue = queue.markDone(slice.id);
-      run.markSliceDone(slice.id);
-      await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
-      await runtime.services.stateRepo.save(run);
+      ctx.queue = ctx.queue.markDone(slice.id);
+      ctx.run.markSliceDone(slice.id);
+      await writeArtifact(runtime, { kind: "sliceQueue" }, ctx.queue.serialize());
+      await runtime.services.stateRepo.save(ctx.run);
 
       await sink.record({
         type: "slice.completed",
@@ -277,10 +194,78 @@ export const sliceLoopStage: StageModule = {
     return {
       status: "PASS",
       filesWritten,
-      summary: `Slice queue exhausted. ${queue.slices.filter((s) => s.status === "done").length} slices completed.`,
+      summary: `Slice queue exhausted. ${ctx.queue.slices.filter((s) => s.status === "done").length} slices completed.`,
     };
   },
 };
+
+// ---------------------------------------------------------------------------
+// Slice lifecycle helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Immediately escalates a slice (no cap check): persists queue + run state and returns the
+ * FAIL outcome. Used when a sub-step signals LOOP_DESIGN or LOOP_GOALS directly.
+ */
+async function escalateSlice(
+  ctx: SliceLoopCtx,
+  sliceId: string,
+  summary: string,
+  backwardLoop: BackwardLoopRequest,
+): Promise<StageOutcome> {
+  ctx.queue = ctx.queue.escalate(sliceId, summary);
+  ctx.run.escalateSlice(sliceId);
+  await writeArtifact(ctx.runtime, { kind: "sliceQueue" }, ctx.queue.serialize());
+  await ctx.runtime.services.stateRepo.save(ctx.run);
+  return { status: "FAIL", filesWritten: ctx.filesWritten, summary, backwardLoop };
+}
+
+/**
+ * Checks the requeue cap. If exceeded, escalates to LOOP_DESIGN and returns the FAIL outcome.
+ * Otherwise requeues and returns undefined — the caller must `continue` the slice loop.
+ */
+async function requeueOrEscalate(
+  ctx: SliceLoopCtx,
+  sliceId: string,
+  reason: string,
+  options: {
+    buildExhaustedSummary: (requeueCount: number) => string;
+    /** "decided" for plan-level requeues (no reason field); "requested" for step failures. */
+    requeueEvent: "requested" | "decided";
+  },
+): Promise<StageOutcome | undefined> {
+  const { runtime, run } = ctx;
+  const sink = runtime.services.telemetrySink;
+  const route = runtime.state.route;
+  const requeueCount = (run.state.requeueCounts[sliceId] ?? 0) + 1;
+
+  if (requeueCount > REQUEUE_CAP) {
+    ctx.queue = ctx.queue.escalate(sliceId, reason);
+    ctx.run.escalateSlice(sliceId);
+    await writeArtifact(runtime, { kind: "sliceQueue" }, ctx.queue.serialize());
+    await runtime.services.stateRepo.save(ctx.run);
+    await sink.record({ type: "requeue.exhausted", route, sliceId, requeueCount });
+    return {
+      status: "FAIL",
+      filesWritten: ctx.filesWritten,
+      summary: options.buildExhaustedSummary(requeueCount),
+      backwardLoop: { classification: "LOOP_DESIGN", summary: reason },
+    };
+  }
+
+  ctx.queue = ctx.queue.requeue(sliceId, reason);
+  run.requeueSlice(sliceId);
+  await writeArtifact(runtime, { kind: "sliceQueue" }, ctx.queue.serialize());
+  await runtime.services.stateRepo.save(run);
+
+  if (options.requeueEvent === "decided") {
+    await sink.record({ type: "requeue.decided", route, sliceId, requeueCount });
+  } else {
+    await sink.record({ type: "requeue.requested", route, sliceId, reason, requeueCount });
+  }
+
+  return undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Sub-step runners

@@ -8,12 +8,25 @@ import {
   artifactRelPath,
   dispatchFailureSummary,
   dispatchLeaf,
+  gateAutoApprovedTelemetry,
+  gateInteractiveTelemetry,
+  gateNoneTelemetry,
   isTransientDispatchFailure,
   readArtifact,
   secondsBetween,
   subStageContext,
   writeArtifact,
 } from "./utils.js";
+
+// Accumulated gate interaction state, mutated across iterations of the approval loop.
+interface GoalsGateCtx {
+  gateRounds: number;
+  gateWaitTimeSeconds: number;
+  gateRoundDetails: GateRoundDetail[];
+}
+
+// Discriminated result from runGoalsGate.
+type GoalsGateResult = { next: "return"; outcome: StageOutcome } | { next: "continue"; feedback: string | undefined };
 
 export const goalsStage: StageModule = {
   stage: "goals",
@@ -24,9 +37,7 @@ export const goalsStage: StageModule = {
         status: "FAIL",
         filesWritten: [],
         summary: "Cannot run Goals without an initial task description.",
-        telemetry: {
-          gate_status: "none",
-        },
+        telemetry: { gate_status: "none" },
       };
     }
 
@@ -38,22 +49,15 @@ export const goalsStage: StageModule = {
         status: "FAIL",
         filesWritten: ["requirements.md"],
         summary: interview.failure,
-        telemetry: {
-          gate_status: "none",
-          review_rounds: 0,
-          gate_rounds: 0,
-          gate_wait_time_s: 0,
-          gate_round_details: [],
-        },
+        telemetry: gateNoneTelemetry(0),
       };
     }
 
     const feedbackHistory: string[] = [];
-    let gateRounds = 0;
-    let gateWaitTimeSeconds = 0;
-    const gateRoundDetails: GateRoundDetail[] = [];
+    const gateCtx: GoalsGateCtx = { gateRounds: 0, gateWaitTimeSeconds: 0, gateRoundDetails: [] };
 
     while (true) {
+      // 1. Synthesize goals
       const synthesized = await dispatchLeaf(
         runtime,
         "dl-goals-synthesizer",
@@ -82,28 +86,21 @@ export const goalsStage: StageModule = {
         ["requirements.md"],
         0,
       );
-      if (synthesisFailure) {
-        return synthesisFailure;
-      }
+      if (synthesisFailure) return synthesisFailure;
+
       const goalsReturn = readGoalsReturn(synthesized);
       if (!goalsReturn) {
         return {
           status: "FAIL",
           filesWritten: ["requirements.md"],
           summary: "Goals synthesis did not call goals_return.",
-          telemetry: {
-            gate_status: "none",
-            review_rounds: 0,
-            gate_rounds: 0,
-            gate_wait_time_s: 0,
-            gate_round_details: [],
-          },
+          telemetry: gateNoneTelemetry(0),
         };
       }
       await writeArtifact(runtime, { kind: "goals" }, goalsReturn.goalsMarkdown);
-      const configMarkdown = renderGoalsConfig(runtime.state.runId, goalsReturn);
-      await writeArtifact(runtime, { kind: "config" }, configMarkdown);
+      await writeArtifact(runtime, { kind: "config" }, renderGoalsConfig(runtime.state.runId, goalsReturn));
 
+      // 2. Run agent review loop
       const interviewRecord = renderInterviewRecord(interview.entries);
       const requirements = await readArtifact(runtime, { kind: "requirements" });
       const review = await runAgentReviewLoop(runtime, {
@@ -161,159 +158,187 @@ export const goalsStage: StageModule = {
           await writeArtifact(runtime, { kind: "config" }, renderGoalsConfig(runtime.state.runId, rewriteReturn));
         },
       });
+
+      const sharedFiles = ["requirements.md", "goals.md", "config.md", ...review.filesWritten];
+
       if (review.status === "FAIL") {
-        const telemetry = {
-          review_rounds: review.reviewRounds,
-          ...(review.dispatchFailure ? {} : { terminal_review_state: "unclean-cap" as const }),
-          gate_status: "none" as const,
-          gate_rounds: 0,
-          gate_wait_time_s: 0,
-          gate_round_details: [],
-        };
         return {
           status: "FAIL",
-          filesWritten: ["requirements.md", "goals.md", "config.md", ...review.filesWritten],
+          filesWritten: sharedFiles,
           summary: review.summary ?? "Goals review loop reached the unresolved review cap.",
-          telemetry,
+          telemetry: gateNoneTelemetry(review.reviewRounds, review.dispatchFailure ? undefined : "unclean-cap"),
         };
       }
 
+      // 3. Automated mode: skip human gate
       if (runtime.services.gates.interactionMode === "automated") {
         const route = "full" as const;
         return {
           status: "PASS",
-          filesWritten: ["requirements.md", "goals.md", "config.md", ...review.filesWritten],
+          filesWritten: sharedFiles,
           route,
           summary: `Goals captured and approved automatically. Route: ${route}.`,
-          telemetry: {
-            review_rounds: review.reviewRounds,
-            terminal_review_state: "clean",
-            gate_status: "approved",
-            gate_mode: "automated",
-            gate_rounds: 0,
-            gate_wait_time_s: 0,
-            gate_round_details: [],
-          },
+          telemetry: gateAutoApprovedTelemetry(review.reviewRounds),
         };
       }
 
-      const goalsCtx = subStageContext(runtime);
-      const presentedAt = new Date().toISOString();
-      await runtime.services.telemetrySink.record({
-        type: "gate.presented",
-        stage: "goals",
-        route: goalsCtx.route,
-        summary: "Goals approval gate presented.",
-      });
-      const decision = await runtime.services.gates.choose(
-        "Goals approval",
-        [
-          { value: "approve", label: "Approve goals and continue" },
-          { value: "feedback", label: "Provide revision feedback" },
-        ],
-        `Review the goals artifact at ${artifactRelPath(runtime, { kind: "goals" })} and choose how to proceed.`,
+      // 4. Human gate
+      const gateResult = await runGoalsGate(runtime, review.reviewRounds, sharedFiles, gateCtx);
+      if (gateResult.next === "return") return gateResult.outcome;
+
+      // 5. Record feedback and loop back to re-synthesize
+      await recordGoalsFeedback(
+        runtime,
+        gateResult.feedback,
+        gateCtx.gateRounds,
+        goalsReturn.goalsMarkdown,
+        userTask,
+        feedbackHistory,
       );
-      const respondedAt = new Date().toISOString();
-      gateRounds += 1;
-      gateWaitTimeSeconds += secondsBetween(presentedAt, respondedAt);
-
-      if (!decision || decision.value === "approve") {
-        gateRoundDetails.push({
-          round: gateRounds,
-          decision: "approved",
-          presented_at: presentedAt,
-          responded_at: respondedAt,
-        });
-        await runtime.services.telemetrySink.record({
-          type: "gate.approved",
-          stage: "goals",
-          route: goalsCtx.route,
-          summary: "Goals gate approved.",
-        });
-        const route = "full" as const;
-        return {
-          status: "PASS",
-          filesWritten: ["requirements.md", "goals.md", "config.md", ...review.filesWritten],
-          route,
-          summary: `Goals captured and approved. Route: ${route}.`,
-          telemetry: {
-            review_rounds: review.reviewRounds,
-            terminal_review_state: "clean",
-            gate_status: "approved",
-            gate_mode: "interactive",
-            gate_rounds: gateRounds - 1,
-            gate_wait_time_s: gateWaitTimeSeconds,
-            gate_round_details: gateRoundDetails,
-          },
-        };
-      }
-
-      gateRoundDetails.push({
-        round: gateRounds,
-        decision: "rejected",
-        presented_at: presentedAt,
-        responded_at: respondedAt,
-      });
-      await runtime.services.telemetrySink.record({
-        type: "gate.rejected",
-        stage: "goals",
-        route: goalsCtx.route,
-        summary: "Goals gate rejected; requesting revision feedback.",
-      });
-
-      const feedback = await runtime.services.gates.askText(
-        "Goals feedback",
-        "Describe the changes needed before the goals can be approved.",
-      );
-      if (!feedback && runtime.services.gates.failurePolicy === "fail-closed") {
-        return {
-          status: "FAIL",
-          filesWritten: ["requirements.md", "goals.md", "config.md", ...review.filesWritten],
-          summary: "Goals approval was rejected without actionable feedback.",
-          telemetry: {
-            review_rounds: review.reviewRounds,
-            terminal_review_state: "clean",
-            gate_status: "rejected",
-            gate_mode: "interactive",
-            gate_rounds: gateRounds,
-            gate_wait_time_s: gateWaitTimeSeconds,
-            gate_round_details: gateRoundDetails,
-          },
-        };
-      }
-
-      const feedbackId = {
-        kind: "feedbackFile" as const,
-        name: `goals-round-${String(gateRounds).padStart(2, "0")}.md`,
-      };
-      const feedbackBlock = [
-        `## Round ${gateRounds} Feedback`,
-        "",
-        "### User Feedback",
-        feedback?.trim() || "No additional feedback supplied.",
-        "",
-        "### Rejected Artifact",
-        goalsReturn.goalsMarkdown.trim(),
-        "",
-      ].join("\n");
-      await writeArtifact(runtime, feedbackId, feedbackBlock);
-      feedbackHistory.push(feedbackBlock);
-
-      const rewrittenRequirements = [
-        "## Original User Task",
-        userTask.trim(),
-        "",
-        "## User Feedback Updates",
-        feedbackHistory
-          .map((entry) => entry.match(/### User Feedback\n([\s\S]*?)\n\n### Rejected Artifact/)?.[1]?.trim() ?? "")
-          .filter(Boolean)
-          .join("\n\n"),
-        "",
-      ].join("\n");
-      await writeArtifact(runtime, { kind: "requirements" }, rewrittenRequirements);
     }
   },
 };
+
+// ---------------------------------------------------------------------------
+// Human gate helpers
+// ---------------------------------------------------------------------------
+
+async function runGoalsGate(
+  runtime: StageRuntime,
+  reviewRounds: number,
+  filesWritten: string[],
+  ctx: GoalsGateCtx,
+): Promise<GoalsGateResult> {
+  const goalsCtx = subStageContext(runtime);
+  const presentedAt = new Date().toISOString();
+  await runtime.services.telemetrySink.record({
+    type: "gate.presented",
+    stage: "goals",
+    route: goalsCtx.route,
+    summary: "Goals approval gate presented.",
+  });
+  const decision = await runtime.services.gates.choose(
+    "Goals approval",
+    [
+      { value: "approve", label: "Approve goals and continue" },
+      { value: "feedback", label: "Provide revision feedback" },
+    ],
+    `Review the goals artifact at ${artifactRelPath(runtime, { kind: "goals" })} and choose how to proceed.`,
+  );
+  const respondedAt = new Date().toISOString();
+  ctx.gateRounds += 1;
+  ctx.gateWaitTimeSeconds += secondsBetween(presentedAt, respondedAt);
+
+  if (!decision || decision.value === "approve") {
+    ctx.gateRoundDetails.push({
+      round: ctx.gateRounds,
+      decision: "approved",
+      presented_at: presentedAt,
+      responded_at: respondedAt,
+    });
+    await runtime.services.telemetrySink.record({
+      type: "gate.approved",
+      stage: "goals",
+      route: goalsCtx.route,
+      summary: "Goals gate approved.",
+    });
+    const route = "full" as const;
+    return {
+      next: "return",
+      outcome: {
+        status: "PASS",
+        filesWritten,
+        route,
+        summary: `Goals captured and approved. Route: ${route}.`,
+        telemetry: gateInteractiveTelemetry(
+          reviewRounds,
+          "approved",
+          ctx.gateRounds - 1,
+          ctx.gateWaitTimeSeconds,
+          ctx.gateRoundDetails,
+        ),
+      },
+    };
+  }
+
+  ctx.gateRoundDetails.push({
+    round: ctx.gateRounds,
+    decision: "rejected",
+    presented_at: presentedAt,
+    responded_at: respondedAt,
+  });
+  await runtime.services.telemetrySink.record({
+    type: "gate.rejected",
+    stage: "goals",
+    route: goalsCtx.route,
+    summary: "Goals gate rejected; requesting revision feedback.",
+  });
+
+  const feedback = await runtime.services.gates.askText(
+    "Goals feedback",
+    "Describe the changes needed before the goals can be approved.",
+  );
+
+  if (!feedback && runtime.services.gates.failurePolicy === "fail-closed") {
+    return {
+      next: "return",
+      outcome: {
+        status: "FAIL",
+        filesWritten,
+        summary: "Goals approval was rejected without actionable feedback.",
+        telemetry: gateInteractiveTelemetry(
+          reviewRounds,
+          "rejected",
+          ctx.gateRounds,
+          ctx.gateWaitTimeSeconds,
+          ctx.gateRoundDetails,
+        ),
+      },
+    };
+  }
+
+  return { next: "continue", feedback };
+}
+
+async function recordGoalsFeedback(
+  runtime: StageRuntime,
+  feedback: string | undefined,
+  gateRound: number,
+  currentGoalsMarkdown: string,
+  userTask: string,
+  feedbackHistory: string[], // mutated: feedback block appended
+): Promise<void> {
+  const feedbackId = { kind: "feedbackFile" as const, name: `goals-round-${String(gateRound).padStart(2, "0")}.md` };
+  const feedbackBlock = [
+    `## Round ${gateRound} Feedback`,
+    "",
+    "### User Feedback",
+    feedback?.trim() || "No additional feedback supplied.",
+    "",
+    "### Rejected Artifact",
+    currentGoalsMarkdown.trim(),
+    "",
+  ].join("\n");
+  await writeArtifact(runtime, feedbackId, feedbackBlock);
+  feedbackHistory.push(feedbackBlock);
+
+  const rewrittenRequirements = [
+    "## Original User Task",
+    userTask.trim(),
+    "",
+    "## User Feedback Updates",
+    feedbackHistory
+      .map((entry) => entry.match(/### User Feedback\n([\s\S]*?)\n\n### Rejected Artifact/)?.[1]?.trim() ?? "")
+      .filter(Boolean)
+      .join("\n\n"),
+    "",
+  ].join("\n");
+  await writeArtifact(runtime, { kind: "requirements" }, rewrittenRequirements);
+}
+
+// ---------------------------------------------------------------------------
+// Interview helpers
+// ---------------------------------------------------------------------------
 
 async function collectInterview(
   runtime: StageRuntime,

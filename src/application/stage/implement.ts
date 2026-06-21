@@ -20,18 +20,11 @@ import {
   parseTaskSpecMetadata,
 } from "../../infra/codec/markdown-codec.js";
 import { buildWaves } from "../../domain/stage/wave-planner.js";
-import type { ArtifactId, StageModule, StageOutcome, StageRuntime, TaskWorktreeHandle } from "../port/index.js";
+import type { ArtifactId, StageOutcome, StageRuntime, TaskWorktreeHandle } from "../port/index.js";
 import { runBaselineRegressionSubstage } from "./baseline-regression.js";
 import { runE2ERegressionSubstage } from "./e2e-regression.js";
 import { runFastImplLoopSubstage } from "./fast-impl-loop.js";
-import {
-  artifactRelPath,
-  dispatchGenericCoding,
-  dispatchLeaf,
-  parseReviewStatus,
-  parseMarkdownSections as _pms,
-  writeArtifact,
-} from "./utils.js";
+import { artifactRelPath, dispatchGenericCoding, dispatchLeaf, parseReviewStatus, writeArtifact } from "./utils.js";
 
 export interface TaskSpecSummary {
   taskId: string;
@@ -235,21 +228,6 @@ export async function runSliceImplementation(runtime: StageRuntime, options: Sli
     telemetry: { child_agent_calls: { "generic-coding": tasks.length * AGENT_CALLS_PER_TASK } },
   };
 }
-
-/**
- * Stub StageModule kept for backwards compatibility — not used in DEEPLOOPER's pipeline loop.
- * The pipeline runs slice-loop.ts which calls runSliceImplementation directly.
- */
-export const implementStage: StageModule = {
-  stage: "slice-loop",
-  run(): Promise<StageOutcome> {
-    return Promise.resolve({
-      status: "FAIL",
-      filesWritten: [],
-      summary: "implementStage: not used directly in DEEPLOOPER.",
-    });
-  },
-};
 
 // ---------------------------------------------------------------------------
 // Task loading

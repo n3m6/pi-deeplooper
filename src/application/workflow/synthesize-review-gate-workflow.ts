@@ -8,6 +8,9 @@
 import {
   artifactRelPath,
   dispatchLeaf,
+  gateAutoApprovedTelemetry,
+  gateInteractiveTelemetry,
+  gateNoneTelemetry,
   readArtifact,
   secondsBetween,
   subStageContext,
@@ -85,14 +88,7 @@ export async function runSynthesizeReviewGate(
         status: "FAIL",
         filesWritten: [artifactDisplayName, ...review.filesWritten],
         summary: `${capitalise(cfg.stageName)} review loop reached the unresolved review cap.`,
-        telemetry: {
-          review_rounds: review.reviewRounds,
-          terminal_review_state: "unclean-cap",
-          gate_status: "none",
-          gate_rounds: 0,
-          gate_wait_time_s: 0,
-          gate_round_details: [],
-        },
+        telemetry: gateNoneTelemetry(review.reviewRounds, "unclean-cap"),
       };
     }
 
@@ -101,15 +97,7 @@ export async function runSynthesizeReviewGate(
         status: "PASS",
         filesWritten: [artifactDisplayName, ...review.filesWritten],
         summary: `${capitalise(cfg.stageName)} synthesized and auto-approved.`,
-        telemetry: {
-          review_rounds: review.reviewRounds,
-          terminal_review_state: "clean",
-          gate_status: "approved",
-          gate_mode: "automated",
-          gate_rounds: 0,
-          gate_wait_time_s: 0,
-          gate_round_details: [],
-        },
+        telemetry: gateAutoApprovedTelemetry(review.reviewRounds),
       };
     }
 
@@ -150,15 +138,13 @@ export async function runSynthesizeReviewGate(
         status: "PASS",
         filesWritten: [artifactDisplayName, ...review.filesWritten],
         summary: `${capitalise(cfg.stageName)} synthesized and approved.`,
-        telemetry: {
-          review_rounds: review.reviewRounds,
-          terminal_review_state: "clean",
-          gate_status: "approved",
-          gate_mode: "interactive",
-          gate_rounds: gateRounds - 1,
-          gate_wait_time_s: gateWaitTimeSeconds,
-          gate_round_details: gateRoundDetails,
-        },
+        telemetry: gateInteractiveTelemetry(
+          review.reviewRounds,
+          "approved",
+          gateRounds - 1,
+          gateWaitTimeSeconds,
+          gateRoundDetails,
+        ),
       };
     }
 
@@ -196,15 +182,13 @@ export async function runSynthesizeReviewGate(
         status: "FAIL",
         filesWritten: [artifactDisplayName, ...review.filesWritten],
         summary: `${capitalise(cfg.stageName)} approval was rejected without actionable feedback.`,
-        telemetry: {
-          review_rounds: review.reviewRounds,
-          terminal_review_state: "clean",
-          gate_status: "rejected",
-          gate_mode: "interactive",
-          gate_rounds: gateRounds,
-          gate_wait_time_s: gateWaitTimeSeconds,
-          gate_round_details: gateRoundDetails,
-        },
+        telemetry: gateInteractiveTelemetry(
+          review.reviewRounds,
+          "rejected",
+          gateRounds,
+          gateWaitTimeSeconds,
+          gateRoundDetails,
+        ),
       };
     }
   }

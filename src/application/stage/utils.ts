@@ -8,9 +8,11 @@ import type {
   ArtifactId,
   DispatchRequest,
   DispatchResult,
+  GateRoundDetail,
   StageOutcome,
   StageRuntime,
   StageName,
+  StageTelemetryContext,
   Route,
 } from "../port/index.js";
 
@@ -212,4 +214,56 @@ export function subStageContext(runtime: StageRuntime): {
     ctx.stage = runtime.currentStage;
   }
   return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// Gate telemetry builders — produce the StageTelemetryContext gate sub-object
+// ---------------------------------------------------------------------------
+
+/** Telemetry for stages where no human gate was presented (review cap, dispatch fail, early exit). */
+export function gateNoneTelemetry(reviewRounds: number, terminal?: "unclean-cap"): StageTelemetryContext {
+  return {
+    review_rounds: reviewRounds,
+    ...(terminal ? { terminal_review_state: terminal } : {}),
+    gate_status: "none",
+    gate_rounds: 0,
+    gate_wait_time_s: 0,
+    gate_round_details: [],
+  };
+}
+
+/** Telemetry for stages auto-approved in automated mode (no human interaction). */
+export function gateAutoApprovedTelemetry(reviewRounds: number): StageTelemetryContext {
+  return {
+    review_rounds: reviewRounds,
+    terminal_review_state: "clean",
+    gate_status: "approved",
+    gate_mode: "automated",
+    gate_rounds: 0,
+    gate_wait_time_s: 0,
+    gate_round_details: [],
+  };
+}
+
+/**
+ * Telemetry for stages where a human gate was decided interactively.
+ * Pass `gateRounds - 1` for approvals (the approval round is not a "feedback" round)
+ * and `gateRounds` for rejections.
+ */
+export function gateInteractiveTelemetry(
+  reviewRounds: number,
+  decision: "approved" | "rejected",
+  gateRounds: number,
+  waitTime: number,
+  details: GateRoundDetail[],
+): StageTelemetryContext {
+  return {
+    review_rounds: reviewRounds,
+    terminal_review_state: "clean",
+    gate_status: decision,
+    gate_mode: "interactive",
+    gate_rounds: gateRounds,
+    gate_wait_time_s: waitTime,
+    gate_round_details: details,
+  };
 }
