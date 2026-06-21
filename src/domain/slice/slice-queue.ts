@@ -2,6 +2,11 @@
  * SliceQueue aggregate — pure domain object, no I/O.
  * Owns the slice-queue.md state: parse, serialize, status mutations, and selection.
  * No node:* or pi imports.
+ *
+ * Design → queue contract:
+ *   1. Prefer the validated ## Slice Manifest JSON block from design.md (parseSliceManifest).
+ *   2. Fall back to the tolerant heading parser (parseDesignSlices) which accepts prose headings.
+ *   3. Callers (slice-loop.ts) must detect zero-result parses on non-empty designs and FAIL loudly.
  */
 
 // ---------------------------------------------------------------------------
@@ -183,6 +188,46 @@ export class SliceQueue {
   }
 
   /**
+   * Reopen a done or escalated slice (sets status back to "ready") when a downstream
+   * stage proves its criterion still fails. Preserves all other fields including history.
+   */
+  reopen(sliceId: string, reason: string): SliceQueue {
+    return this.mutate(sliceId, (s) => ({
+      ...s,
+      status: "ready",
+      lastReason: reason,
+    }));
+  }
+
+  /**
+   * Find an existing done or escalated slice that "owns" a given acceptance criterion
+   * (i.e., the criterion appears verbatim in the slice's acceptanceCriteria array).
+   * Returns undefined when no existing slice owns the criterion.
+   */
+  findSliceOwningCriterion(criterion: string): Slice | undefined {
+    return this._slices.find(
+      (s) =>
+        (s.status === "done" || s.status === "escalated") &&
+        s.acceptanceCriteria.some((ac) => ac.trim() === criterion.trim()),
+    );
+  }
+
+  /**
+   * Process proposed remediation entries from dl-reflector: for each entry, if an
+   * existing done/escalated slice owns all of its acceptance criteria, reopen that slice
+   * instead of appending a new R-NNN. Only append genuinely new R-NNN slices.
+   *
+   * Returns `{ queue, reopened, added }` so callers can record telemetry.
+   */
+  applyRemediationWithReopen(proposedEntries: Array<{ id: string; title: string; acceptanceCriteria: string[] }>): {
+    queue: SliceQueue;
+    reopened: string[];
+    added: string[];
+  } {
+    return applyRemediationWithReopenHelper(this, proposedEntries);
+  }
+
+  /**
    * Append remediation slices from verify/accept red criteria.
    * Remediation slices get IDs in the form R-NNN, are source="remediation",
    * have no deps (they can run independently), and their phaseDir is computed
@@ -220,45 +265,61 @@ export class SliceQueue {
    *     - criterion 2
    */
   addRemediationSlicesFromMarkdown(block: string): SliceQueue {
-    const criteria: Array<{ id: string; title: string; acceptanceCriteria: string[] }> = [];
-    const sections = block.split(/^### /m).slice(1);
-    for (const section of sections) {
-      const lines = section.split("\n");
-      const header = lines[0] ?? "";
-      const headerMatch = header.match(/^([A-Za-z0-9_-]+):\s*(.+)$/);
-      if (!headerMatch) continue;
-      const id = (headerMatch[1] ?? "").trim();
-      const title = (headerMatch[2] ?? "").trim();
-      const body = lines.slice(1).join("\n");
-      const acceptanceCriteria = parseListField(body, "acceptance_criteria");
-      criteria.push({ id, title, acceptanceCriteria });
-    }
-    return this.addRemediationSlices(criteria);
+    return this.addRemediationSlices(parseRemediationEntriesFromMarkdown(block));
   }
 
   /**
-   * Build an initial queue from the design.md (Vertical Slices section) and
-   * skeleton-results.md (slice-0 outcome).
-   * Expected design.md format:
-   *   ## Vertical Slices
-   *   ### <id>: <title>
-   *   - deps: <dep1>, <dep2> | none
-   *   - acceptance_criteria: <list>
+   * Like `addRemediationSlicesFromMarkdown` but first attempts to reopen existing
+   * done/escalated slices that already own the failing criteria, appending fresh
+   * R-NNN entries only for genuinely uncovered criteria.
+   */
+  applyRemediationFromMarkdown(block: string): { queue: SliceQueue; reopened: string[]; added: string[] } {
+    const entries = parseRemediationEntriesFromMarkdown(block);
+    return this.applyRemediationWithReopen(entries);
+  }
+
+  /**
+   * Build an initial queue from the design.md.
+   *
+   * Priority order:
+   *   1. ## Slice Manifest JSON block — machine-readable, typebox-validated.
+   *   2. ## Vertical Slices prose headings — tolerant fallback parser that derives synthetic
+   *      ids (S1, S2…) from document order when headings contain spaces.
+   *
+   * Returns an empty queue only when the design genuinely has no slices section.
+   * Callers (slice-loop.ts) are responsible for detecting the "section exists but empty"
+   * case and failing loudly with a pipeline.anomaly event.
    */
   static buildInitial(designMd: string, _skeletonResultsMd?: string): SliceQueue {
-    const slices = parseDesignSlices(designMd);
+    const slices = parseDesignSlicesFromManifestOrHeadings(designMd);
     return new SliceQueue(slices);
   }
 
   /**
    * Reconcile the queue after a Design/Goals escalation: rebuild from the new design
-   * document but preserve any slices that are already "done".
-   * Slices not in the new design are dropped (unless done).
+   * document but preserve any slices that are already "done" — unless their criterion
+   * is in the provided `failingCriteria` set (meaning a downstream stage proved the
+   * slice is not actually done).
+   *
+   * Slices not in the new design are dropped (unless done and not failing).
    * New slices from the design are added as "pending".
    */
-  reconcile(newDesignMd: string, options: { preserveDone: boolean }): SliceQueue {
-    const newSlices = parseDesignSlices(newDesignMd);
-    const doneSlices = options.preserveDone ? this._slices.filter((s) => s.status === "done") : [];
+  reconcile(newDesignMd: string, options: { preserveDone: boolean; failingCriteria?: Set<string> }): SliceQueue {
+    const newSlices = parseDesignSlicesFromManifestOrHeadings(newDesignMd);
+
+    const doneSlices = options.preserveDone
+      ? this._slices.filter((s) => {
+          if (s.status !== "done") return false;
+          // Do not preserve if any of the slice's criteria are in the failing set.
+          if (options.failingCriteria && options.failingCriteria.size > 0) {
+            const ownsFailingCriterion = s.acceptanceCriteria.some((ac) =>
+              (options.failingCriteria as Set<string>).has(ac.trim()),
+            );
+            if (ownsFailingCriterion) return false;
+          }
+          return true;
+        })
+      : [];
 
     const doneIds = new Set(doneSlices.map((s) => s.id));
 
@@ -315,31 +376,183 @@ function parseOptionalField(body: string, key: string): string | undefined {
   return match?.[1]?.trim();
 }
 
+// ---------------------------------------------------------------------------
+// applyRemediationWithReopen — implemented as a free function to avoid `this` aliasing
+// ---------------------------------------------------------------------------
+
+function applyRemediationWithReopenHelper(
+  queue: SliceQueue,
+  proposedEntries: Array<{ id: string; title: string; acceptanceCriteria: string[] }>,
+): { queue: SliceQueue; reopened: string[]; added: string[] } {
+  let current = queue;
+  const reopened: string[] = [];
+  const toAdd: Array<{ id: string; title: string; acceptanceCriteria: string[] }> = [];
+
+  for (const entry of proposedEntries) {
+    // Find an existing slice that owns every criterion in this entry.
+    const ownedBy = entry.acceptanceCriteria.every((ac) => current.findSliceOwningCriterion(ac) !== undefined)
+      ? current.findSliceOwningCriterion(entry.acceptanceCriteria[0] ?? "")
+      : undefined;
+
+    if (ownedBy) {
+      current = current.reopen(
+        ownedBy.id,
+        `Reopened: downstream stage proved criterion still fails. Proposed remediation: ${entry.title}`,
+      );
+      reopened.push(ownedBy.id);
+    } else {
+      toAdd.push(entry);
+    }
+  }
+
+  if (toAdd.length > 0) {
+    current = current.addRemediationSlices(toAdd);
+  }
+
+  const added = toAdd.map((e) => e.id);
+  return { queue: current, reopened, added };
+}
+
+// ---------------------------------------------------------------------------
+// Remediation markdown parser (shared by addRemediationSlicesFromMarkdown + applyRemediationFromMarkdown)
+// ---------------------------------------------------------------------------
+
+function parseRemediationEntriesFromMarkdown(
+  block: string,
+): Array<{ id: string; title: string; acceptanceCriteria: string[] }> {
+  const criteria: Array<{ id: string; title: string; acceptanceCriteria: string[] }> = [];
+  const sections = block.split(/^### /m).slice(1);
+  for (const section of sections) {
+    const lines = section.split("\n");
+    const header = lines[0] ?? "";
+    const headerMatch = header.match(/^([A-Za-z0-9_-]+):\s*(.+)$/);
+    if (!headerMatch) continue;
+    const id = (headerMatch[1] ?? "").trim();
+    const title = (headerMatch[2] ?? "").trim();
+    const body = lines.slice(1).join("\n");
+    const acceptanceCriteria = parseListField(body, "acceptance_criteria");
+    criteria.push({ id, title, acceptanceCriteria });
+  }
+  return criteria;
+}
+
 /**
- * Parse the `## Vertical Slices` section of a design.md into a list of Slices.
+ * Manifest-first strategy: try the ## Slice Manifest JSON block, fall back to the
+ * tolerant prose heading parser. Returns [] only when both sources yield nothing.
  */
-function parseDesignSlices(designMd: string): Slice[] {
-  // Split by top-level `## ` headers and find the "Vertical Slices" section.
+function parseDesignSlicesFromManifestOrHeadings(designMd: string): Slice[] {
+  // --- Try manifest first ---
+  const manifestResult = tryParseSliceManifest(designMd);
+  if (manifestResult !== null) {
+    return manifestResult;
+  }
+
+  // --- Fall back to tolerant prose heading parse ---
+  return parseDesignSlicesTolerant(designMd);
+}
+
+/**
+ * Attempt to parse the ## Slice Manifest JSON block.
+ * Returns null when the section is absent (no error — just no manifest).
+ * Returns [] when the section is present but JSON is malformed (signals an anomaly to callers).
+ * Returns the slice array on success.
+ */
+function tryParseSliceManifest(designMd: string): Slice[] | null {
+  const topSections = designMd.split(/^## /m);
+  const manifestSection = topSections.find((s) => s.match(/^Slice Manifest\b/));
+  if (!manifestSection) {
+    return null;
+  }
+
+  const jsonMatch = manifestSection.match(/```json\s*\n([\s\S]*?)\n```/);
+  if (!jsonMatch?.[1]) {
+    return [];
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonMatch[1]);
+  } catch {
+    return [];
+  }
+
+  if (!isSliceManifestShape(parsed)) {
+    return [];
+  }
+
+  const manifest = parsed as { slices: Array<Record<string, unknown>> };
+  const slices: Slice[] = [];
+  let phaseNum = 1;
+
+  for (const entry of manifest.slices) {
+    const id = typeof entry["id"] === "string" ? entry["id"].trim() : "";
+    const title = typeof entry["title"] === "string" ? entry["title"].trim() : id;
+    if (!id) continue;
+
+    const deps = Array.isArray(entry["deps"])
+      ? (entry["deps"] as unknown[]).filter((d): d is string => typeof d === "string")
+      : [];
+    const ac = Array.isArray(entry["acceptanceCriteria"])
+      ? (entry["acceptanceCriteria"] as unknown[]).filter((c): c is string => typeof c === "string")
+      : [];
+
+    slices.push({
+      id,
+      title,
+      deps,
+      status: "pending",
+      requeueCount: 0,
+      acceptanceCriteria: ac,
+      phaseDir: `phases/phase-${String(phaseNum++).padStart(2, "0")}`,
+      source: "design",
+    });
+  }
+
+  return slices;
+}
+
+function isSliceManifestShape(value: unknown): value is { slices: unknown[] } {
+  if (typeof value !== "object" || value === null) return false;
+  return Array.isArray((value as Record<string, unknown>)["slices"]);
+}
+
+/**
+ * Tolerant prose heading parser — accepts any `### <anything>: <title>` heading.
+ * When the id token contains spaces (e.g. `### Slice 1: Name`), derives a synthetic
+ * id `S<N>` from document order and uses the full heading text as the title.
+ */
+function parseDesignSlicesTolerant(designMd: string): Slice[] {
   const topLevelSections = designMd.split(/^## /m);
   const vsRaw = topLevelSections.find((s) => s.match(/^Vertical Slices/));
   if (!vsRaw) {
     return [];
   }
-  // Remove the header line itself, keep the body.
   const slicesSection = vsRaw.replace(/^[^\n]+\n/, "");
   const sliceBlocks = slicesSection.split(/^###\s+/m).slice(1);
   const slices: Slice[] = [];
   let phaseNum = 1;
 
   for (const block of sliceBlocks) {
-    const headerMatch = block.match(/^([A-Za-z0-9_-]+):\s*(.+)/);
-    if (!headerMatch) {
-      continue;
-    }
-    const id = (headerMatch[1] ?? "").trim();
-    const title = (headerMatch[2] ?? "").trim();
-    const body = block.slice(headerMatch[0].length);
+    const headerLine = (block.split("\n")[0] ?? "").trim();
+    if (!headerLine) continue;
 
+    let id: string;
+    let title: string;
+
+    // Try strict no-space id first (original grammar).
+    const strictMatch = headerLine.match(/^([A-Za-z0-9_-]+):\s*(.+)/);
+    if (strictMatch) {
+      id = (strictMatch[1] ?? "").trim();
+      title = (strictMatch[2] ?? "").trim();
+    } else {
+      // Tolerant: use synthetic id from position, full heading as title.
+      id = `S${phaseNum}`;
+      // Keep everything before the first colon as part of the title if a colon exists.
+      const colonIdx = headerLine.indexOf(":");
+      title = colonIdx > 0 ? headerLine.slice(colonIdx + 1).trim() || headerLine : headerLine;
+    }
+
+    const body = block.slice(block.indexOf("\n") + 1);
     const deps = parseListField(body, "deps");
     const ac = parseListField(body, "acceptance_criteria");
 

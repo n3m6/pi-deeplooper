@@ -5,15 +5,17 @@
  * Resume behavior: early-PASS when structure.md already exists.
  */
 
+import { parsePipeTable } from "../../infra/codec/markdown-codec.js";
 import { runAgentReviewLoop } from "../workflow/agent-review-loop.js";
 import { runFastImplLoopSubstage } from "./fast-impl-loop.js";
-import type { StageModule, StageOutcome } from "../port/index.js";
+import type { StageModule, StageOutcome, StageRuntime } from "../port/index.js";
 import {
   artifactRelPath,
   dispatchFailureSummary,
   dispatchLeaf,
   isTransientDispatchFailure,
   readArtifact,
+  recordAnomaly,
   safeReadArtifact,
   writeArtifact,
 } from "./utils.js";
@@ -24,15 +26,31 @@ export const skeletonStage: StageModule = {
     const repo = runtime.services.artifactRepo;
     const signal = runtime.services.eventContext.signal;
 
-    // Early-PASS when structure.md exists (resume or escalation re-entry).
+    // Early-PASS when structure.md exists AND the scaffold files it specifies are on disk.
+    // If structure.md exists but the files are absent (e.g. after a design escalation that
+    // changed the scaffold), fall through and rebuild.
     const structureExists = await repo.exists({ kind: "structure" });
     if (structureExists) {
-      return {
-        status: "PASS",
-        filesWritten: [],
-        summary: "structure.md already exists; skeleton early-PASS (resume/re-entry).",
-        telemetry: { deterministic_fast_path: "resume-skip" },
-      };
+      const structureMd = (await repo.read({ kind: "structure" })) ?? "";
+      const missingScaffold = await findMissingScaffoldFiles(runtime, structureMd);
+
+      if (missingScaffold.length === 0) {
+        return {
+          status: "PASS",
+          filesWritten: [],
+          summary: "structure.md already exists; skeleton early-PASS (resume/re-entry).",
+          telemetry: { deterministic_fast_path: "resume-skip" },
+        };
+      }
+
+      // Scaffold files are missing — emit an anomaly and fall through to rebuild.
+      await recordAnomaly(
+        runtime,
+        "skeleton-scaffold-missing",
+        "warning",
+        `structure.md exists but ${missingScaffold.length} expected scaffold file(s) are absent from disk — rebuilding skeleton.`,
+        { missingFiles: missingScaffold },
+      );
     }
 
     const goals = await readArtifact(runtime, { kind: "goals" });
@@ -252,4 +270,34 @@ function renderStage7Summary(): string {
     "",
     "Skeleton scaffolding built and structure.md approved.",
   ].join("\n");
+}
+
+/**
+ * Parse expected CREATE files from structure.md's File Map table and return the subset
+ * that are absent from the workspace. Returns [] when all files are present (or when
+ * structure.md has no parseable File Map table).
+ */
+async function findMissingScaffoldFiles(runtime: StageRuntime, structureMd: string): Promise<string[]> {
+  const repo = runtime.services.artifactRepo;
+
+  // The File Map section is a pipe table under "## File Map" or inside a Slice section.
+  // Rows look like: | `path/to/file.ts` | CREATE | Purpose |
+  const rows = parsePipeTable(structureMd);
+  const missing: string[] = [];
+
+  for (const row of rows) {
+    // Skip header/separator rows and rows where the action column doesn't say CREATE.
+    if (row.length < 2) continue;
+    const rawPath = (row[0] ?? "").replace(/`/g, "").trim();
+    const action = (row[1] ?? "").trim().toUpperCase();
+    if (!rawPath || !action.includes("CREATE")) continue;
+
+    // Check if the file exists in the workspace.
+    const content = await repo.readWorkspaceFile(rawPath);
+    if (content === undefined) {
+      missing.push(rawPath);
+    }
+  }
+
+  return missing;
 }

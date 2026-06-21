@@ -168,11 +168,12 @@ export const acceptStage: StageModule = {
 
     // dl-reflector is a read-only leaf, so the controller parses its return and writes
     // the queue (pattern B). Remediation slices are returned as `### R-NNN: <title>`
-    // sections; remediation is "added" only when the queue actually grows.
+    // sections; remediation is "added" (or an existing done slice is reopened) only when
+    // the queue actually changes. Prefer reopening a falsely-done slice over adding R-NNN.
     const reflectSections = parseMarkdownSections(reflect.text);
     const existingQueue = sliceQueueMd ? SliceQueue.parse(sliceQueueMd) : SliceQueue.empty();
-    const updatedQueue = existingQueue.addRemediationSlicesFromMarkdown(reflect.text);
-    const remediationSlicesAdded = updatedQueue.length > existingQueue.length;
+    const { queue: updatedQueue, reopened, added } = existingQueue.applyRemediationFromMarkdown(reflect.text);
+    const remediationSlicesAdded = reopened.length > 0 || added.length > 0;
 
     if (remediationSlicesAdded) {
       await writeArtifact(runtime, { kind: "sliceQueue" }, updatedQueue.serialize());
@@ -187,6 +188,8 @@ export const acceptStage: StageModule = {
         telemetry: {
           acceptance_loop_rounds: round,
           remediationSlicesAdded: true,
+          slicesReopened: reopened,
+          slicesAdded: added,
           child_agent_calls: { "dl-coverage-planner": 1, "dl-reflector": 1 },
         },
       };

@@ -63,6 +63,31 @@ Produce a markdown document with this structure:
 - Slice 3 -> Foundation Slice
 Write `None.` if all slices are independent.]
 
+`## Slice Manifest`
+
+This section is machine-read by the pipeline controller. It **must** be present and correctly formatted whenever `## Vertical Slices` contains any slices.
+
+```json
+{
+  "slices": [
+    {
+      "id": "S1",
+      "title": "Slice title matching the heading above",
+      "deps": [],
+      "acceptanceCriteria": [
+        "Concrete, testable criterion (matches the done gate above)"
+      ]
+    }
+  ]
+}
+```
+
+Rules:
+- `id` must be a short alphanumeric token with no spaces (e.g. `S1`, `S2`, `Foundation`).
+- `deps` is an array of other slice `id`s that must complete first; use `[]` when independent.
+- `acceptanceCriteria` must contain at least one entry per slice.
+- Every slice in `## Vertical Slices` must appear in this manifest. No extra slices.
+
 `## Phases`
 
 `### Phase 1: [name]`
@@ -100,3 +125,4 @@ Before writing the final output, verify each of the following:
 - [ ] Every slice has a done gate with at least two concrete, testable criteria.
 - [ ] The test strategy names specific behaviors per slice.
 - [ ] The design is concrete enough for `dl-skeleton` to select the thinnest implementable slice and for `dl-structure-mapper` to identify the relevant slice scope.
+- [ ] `## Slice Manifest` is present and contains valid JSON with `id` (no spaces), `deps` (array), and `acceptanceCriteria` (non-empty array) for every slice declared in `## Vertical Slices`.

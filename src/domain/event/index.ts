@@ -49,7 +49,8 @@ export type DomainEvent =
   | SliceCompleted
   | RequeueRequested
   | RequeueDecided
-  | RequeueExhausted;
+  | RequeueExhausted
+  | PipelineAnomaly;
 
 export interface RunStarted {
   type: "run.started";
@@ -302,4 +303,22 @@ export interface RequeueExhausted {
   route: Route;
   sliceId: string;
   requeueCount: number;
+}
+
+/**
+ * Emitted whenever the orchestrator detects a silent degradation that would otherwise
+ * leave no trace in the run-log: empty parse results, vacuous done-checks, unparseable
+ * designs, no-progress backward loops, missing scaffold files, etc.
+ *
+ * Stable codes: design-slices-unparsed, slice-no-evidence, done-check-vacuous,
+ * slice-plan-empty, backward-loop-no-progress, skeleton-scaffold-missing.
+ */
+export interface PipelineAnomaly {
+  type: "pipeline.anomaly";
+  code: string;
+  severity: "info" | "warning" | "error";
+  stage?: StageName;
+  route: Route;
+  summary: string;
+  context?: Record<string, unknown>;
 }

@@ -11,6 +11,8 @@ import {
   extractSummary,
   extractCodeBlock,
   parsePipeTable,
+  parseSliceManifest,
+  designDeclaresSlices,
 } from "../../src/infra/codec/markdown-codec.js";
 
 // ---------------------------------------------------------------------------
@@ -230,4 +232,90 @@ test("parsePipeTable trims cell whitespace", () => {
   const rows = parsePipeTable(md);
   assert.deepEqual(rows[0], ["A", "B"]);
   assert.deepEqual(rows[1], ["1", "2"]);
+});
+
+// ---------------------------------------------------------------------------
+// parseSliceManifest
+// ---------------------------------------------------------------------------
+
+const VALID_MANIFEST_MD = `# Design
+
+## Vertical Slices
+
+### Slice 1: Health endpoint
+
+## Slice Manifest
+
+\`\`\`json
+{
+  "slices": [
+    {
+      "id": "S1",
+      "title": "Health endpoint",
+      "deps": [],
+      "acceptanceCriteria": ["GET /health returns 200"]
+    },
+    {
+      "id": "S2",
+      "title": "Auth endpoint",
+      "deps": ["S1"],
+      "acceptanceCriteria": ["POST /login returns token", "Invalid creds return 401"]
+    }
+  ]
+}
+\`\`\`
+
+## Other Section
+Ignored.
+`;
+
+test("parseSliceManifest returns ok:true with well-formed manifest", () => {
+  const result = parseSliceManifest(VALID_MANIFEST_MD);
+  assert.ok(result.ok, "expected ok: true");
+  if (!result.ok) return;
+  assert.equal(result.slices.length, 2);
+  assert.equal(result.slices[0]?.id, "S1");
+  assert.deepEqual(result.slices[0]?.deps, []);
+  assert.deepEqual(result.slices[0]?.acceptanceCriteria, ["GET /health returns 200"]);
+  assert.equal(result.slices[1]?.id, "S2");
+  assert.deepEqual(result.slices[1]?.deps, ["S1"]);
+});
+
+test("parseSliceManifest returns ok:false when section is absent", () => {
+  const result = parseSliceManifest("# Design\n\n## Vertical Slices\n\n### S1: Foo\n");
+  assert.ok(!result.ok);
+});
+
+test("parseSliceManifest returns ok:false when JSON is malformed", () => {
+  const md = `# Design\n\n## Slice Manifest\n\n\`\`\`json\n{ broken json\n\`\`\`\n`;
+  const result = parseSliceManifest(md);
+  assert.ok(!result.ok);
+});
+
+test("parseSliceManifest returns ok:false when id contains spaces", () => {
+  const md = `# Design\n\n## Slice Manifest\n\n\`\`\`json\n{"slices":[{"id":"Slice 1","title":"x","deps":[],"acceptanceCriteria":["y"]}]}\n\`\`\`\n`;
+  const result = parseSliceManifest(md);
+  assert.ok(!result.ok);
+});
+
+test("parseSliceManifest returns ok:false when acceptanceCriteria is empty", () => {
+  const md = `# Design\n\n## Slice Manifest\n\n\`\`\`json\n{"slices":[{"id":"S1","title":"x","deps":[],"acceptanceCriteria":[]}]}\n\`\`\`\n`;
+  const result = parseSliceManifest(md);
+  assert.ok(!result.ok);
+});
+
+// ---------------------------------------------------------------------------
+// designDeclaresSlices
+// ---------------------------------------------------------------------------
+
+test("designDeclaresSlices returns true when ## Slice Manifest is present", () => {
+  assert.ok(designDeclaresSlices("# Design\n\n## Slice Manifest\n\n```json\n{}\n```\n"));
+});
+
+test("designDeclaresSlices returns true when ## Vertical Slices is present", () => {
+  assert.ok(designDeclaresSlices("# Design\n\n## Vertical Slices\n\n### S1: Foo\n"));
+});
+
+test("designDeclaresSlices returns false for design without slice sections", () => {
+  assert.ok(!designDeclaresSlices("# Design\n\n## Approach\n\nJust prose.\n"));
 });

@@ -153,7 +153,8 @@ export interface TelemetryEvent {
     | "slice.completed"
     | "requeue.requested"
     | "requeue.decided"
-    | "requeue.exhausted";
+    | "requeue.exhausted"
+    | "pipeline.anomaly";
   status: string;
   route: Route;
   summary: string;

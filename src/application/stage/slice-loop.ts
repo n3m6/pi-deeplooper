@@ -21,10 +21,10 @@
 
 import { SliceQueue } from "../../domain/slice/slice-queue.js";
 import { Run, MAX_REQUEUE } from "../../domain/run/index.js";
-import { parseMarkdownSections, parseReviewStatus } from "../../infra/codec/markdown-codec.js";
+import { designDeclaresSlices, parseMarkdownSections, parseReviewStatus } from "../../infra/codec/markdown-codec.js";
 import type { BackwardLoopRequest, StageModule, StageOutcome, StageRuntime } from "../port/index.js";
 import { runSliceImplementation } from "./implement.js";
-import { appendReflectorSection, dispatchLeaf, safeReadArtifact, writeArtifact } from "./utils.js";
+import { appendReflectorSection, dispatchLeaf, recordAnomaly, safeReadArtifact, writeArtifact } from "./utils.js";
 
 const REQUEUE_CAP = MAX_REQUEUE;
 
@@ -71,6 +71,27 @@ export const sliceLoopStage: StageModule = {
       const skeletonResultsMd = await safeReadArtifact(runtime, { kind: "skeletonResults" });
       queue = SliceQueue.buildInitial(designMd, skeletonResultsMd);
       await writeArtifact(runtime, { kind: "sliceQueue" }, queue.serialize());
+
+      // Loud-fail: design declares slices but none could be parsed.
+      if (queue.length === 0 && designDeclaresSlices(designMd)) {
+        await recordAnomaly(
+          runtime,
+          "design-slices-unparsed",
+          "error",
+          "design.md declares a ## Slice Manifest or ## Vertical Slices section but no slices could be parsed — check the manifest JSON and slice heading format.",
+          { designLength: designMd.length },
+        );
+        return {
+          status: "FAIL",
+          filesWritten: ["slice-queue.md"],
+          summary:
+            "design-slices-unparsed: design declares slices but none could be parsed from ## Slice Manifest or ## Vertical Slices.",
+          backwardLoop: {
+            classification: "LOOP_DESIGN",
+            summary: "Design slice manifest could not be parsed; design needs revision.",
+          },
+        };
+      }
     }
 
     const filesWritten: string[] = ["slice-queue.md"];
@@ -168,6 +189,19 @@ export const sliceLoopStage: StageModule = {
         continue;
       }
 
+      // 4b. Controller-side evidence gate — must come before markDone.
+      // Catches vacuous done-checks (0 tasks implemented) and red build/test scripts.
+      const evidenceCheck = await assertSliceProducedEvidence(runtime, phase, slice.id);
+      if (evidenceCheck.status === "FAIL") {
+        const outcome = await requeueOrEscalate(ctx, slice.id, evidenceCheck.reason, {
+          buildExhaustedSummary: (count) =>
+            `Slice ${slice.id} evidence gate failed ${count} times: ${evidenceCheck.reason}`,
+          requeueEvent: "requested",
+        });
+        if (outcome) return outcome;
+        continue;
+      }
+
       // 5. dl-reflector (slice-success) — append lessons.md, spec-history.md; may amend goals.md.
       await runSliceReflect(runtime, slice.id, slice.title, implOutcome.summary);
       filesWritten.push("lessons.md", "spec-history.md");
@@ -217,7 +251,22 @@ async function escalateSlice(
   ctx.run.escalateSlice(sliceId);
   await writeArtifact(ctx.runtime, { kind: "sliceQueue" }, ctx.queue.serialize());
   await ctx.runtime.services.stateRepo.save(ctx.run);
-  return { status: "FAIL", filesWritten: ctx.filesWritten, summary, backwardLoop };
+
+  // Consult dl-backward-loop-detector to set a precise classification on design/goals loops.
+  let resolvedLoop = backwardLoop;
+  if (backwardLoop.classification === "LOOP_DESIGN" || backwardLoop.classification === "LOOP_GOALS") {
+    const detected = await classifyEscalationWithDetector(
+      ctx.runtime,
+      sliceId,
+      backwardLoop.summary,
+      ctx.run.state.requeueCounts[sliceId] ?? 0,
+    );
+    if (detected !== "NO_LOOP") {
+      resolvedLoop = { ...backwardLoop, classification: detected };
+    }
+  }
+
+  return { status: "FAIL", filesWritten: ctx.filesWritten, summary, backwardLoop: resolvedLoop };
 }
 
 /**
@@ -245,11 +294,17 @@ async function requeueOrEscalate(
     await writeArtifact(runtime, { kind: "sliceQueue" }, ctx.queue.serialize());
     await runtime.services.stateRepo.save(ctx.run);
     await sink.record({ type: "requeue.exhausted", route, sliceId, requeueCount });
+
+    // Consult dl-backward-loop-detector to set a precise classification.
+    const detectedClassification = await classifyEscalationWithDetector(runtime, sliceId, reason, requeueCount);
+    const classification: "LOOP_DESIGN" | "LOOP_GOALS" =
+      detectedClassification === "NO_LOOP" ? "LOOP_DESIGN" : detectedClassification;
+
     return {
       status: "FAIL",
       filesWritten: ctx.filesWritten,
       summary: options.buildExhaustedSummary(requeueCount),
-      backwardLoop: { classification: "LOOP_DESIGN", summary: reason },
+      backwardLoop: { classification, summary: reason },
     };
   }
 
@@ -432,4 +487,147 @@ async function runSliceReflect(
 function classifyEscalation(target: string): "LOOP_DESIGN" | "LOOP_GOALS" {
   if (/goals/i.test(target)) return "LOOP_GOALS";
   return "LOOP_DESIGN";
+}
+
+/**
+ * Dispatch dl-backward-loop-detector with the persistent-failure context for a slice
+ * and use its classification to set the backward-loop classification. Returns the
+ * classification derived from the agent, or the heuristic fallback on dispatch failure.
+ *
+ * The agent returns a markdown response including:
+ *   **Overall Recommendation**: NO_LOOP | LOOP_DESIGN | LOOP_GOALS
+ *   **Affected Artifact**: design | goals | structure
+ */
+async function classifyEscalationWithDetector(
+  runtime: StageRuntime,
+  sliceId: string,
+  reason: string,
+  requeueCount: number,
+): Promise<"LOOP_DESIGN" | "LOOP_GOALS" | "NO_LOOP"> {
+  const design = await safeReadArtifact(runtime, { kind: "design" });
+  const goals = await safeReadArtifact(runtime, { kind: "goals" });
+  const lessons = await safeReadArtifact(runtime, { kind: "lessons" });
+
+  const result = await dispatchLeaf(
+    runtime,
+    "dl-backward-loop-detector",
+    [
+      "=== SLICE ID ===",
+      sliceId,
+      "",
+      "=== REQUEUE COUNT ===",
+      String(requeueCount),
+      "",
+      "=== FAILURE REASON ===",
+      reason,
+      "",
+      "=== GOALS ===",
+      goals || "(none)",
+      "",
+      "=== DESIGN ===",
+      design || "(none)",
+      "",
+      "=== LESSONS ===",
+      lessons || "(none)",
+    ].join("\n"),
+    { taskId: `${sliceId}-loop-detect` },
+  );
+
+  if (result.endReason === "aborted" || result.errorMessage) {
+    // Fall back to heuristic on dispatch failure.
+    return classifyEscalation(reason);
+  }
+
+  const text = result.text ?? "";
+  const recMatch = text.match(/\*\*Overall Recommendation\*\*:\s*(NO_LOOP|LOOP_DESIGN|LOOP_GOALS)/i);
+  if (!recMatch) {
+    return classifyEscalation(reason);
+  }
+
+  const rec = (recMatch[1] ?? "").toUpperCase();
+  if (rec === "NO_LOOP") return "NO_LOOP";
+  if (rec === "LOOP_GOALS") return "LOOP_GOALS";
+  return "LOOP_DESIGN";
+}
+
+// ---------------------------------------------------------------------------
+// Evidence gate — controller-side check between done-check PASS and markDone
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies that a slice that the agent-side done-check claimed PASS actually produced
+ * real work: at least one real file was changed AND all configured build/test scripts pass.
+ *
+ * Catches the "0 tasks, marked done" vacuous-pass failure mode deterministically.
+ */
+async function assertSliceProducedEvidence(
+  runtime: StageRuntime,
+  phase: number,
+  sliceId: string,
+): Promise<{ status: "PASS" | "FAIL"; reason: string }> {
+  const repo = runtime.services.artifactRepo;
+  const buildTool = runtime.services.buildTool;
+  const signal = runtime.services.eventContext.signal;
+
+  // --- File evidence: read the stage7-summary to detect "0 task(s)" ---
+  const stage7 = (await repo.read({ kind: "phaseFile", phase, name: "stage7-summary.md" })) ?? "";
+  const taskCountMatch = stage7.match(/across\s+(\d+)\s+task\(s\)/i);
+  if (taskCountMatch) {
+    const taskCount = parseInt(taskCountMatch[1] ?? "0", 10);
+    if (taskCount === 0) {
+      await recordAnomaly(
+        runtime,
+        "done-check-vacuous",
+        "error",
+        `Slice ${sliceId} done-check passed vacuously: 0 tasks were planned/executed. No implementation work happened.`,
+        { sliceId, phase, taskCount: 0 },
+      );
+      return {
+        status: "FAIL",
+        reason: `Slice ${sliceId} done-check vacuous PASS: 0 implementation tasks were executed. The slice planner produced no tasks.`,
+      };
+    }
+  }
+
+  // --- File evidence: verify that the execution manifest shows at least one PASS task ---
+  const manifest = (await repo.read({ kind: "phaseFile", phase, name: "execution-manifest.md" })) ?? "";
+  const hasNoRealTasks = /^\|\s*None\s*\|\s*None\s*\|/m.test(manifest);
+  if (hasNoRealTasks && manifest.trim() !== "") {
+    await recordAnomaly(
+      runtime,
+      "slice-no-evidence",
+      "error",
+      `Slice ${sliceId} execution manifest shows no tasks were executed.`,
+      { sliceId, phase },
+    );
+    return {
+      status: "FAIL",
+      reason: `Slice ${sliceId} evidence gate: execution manifest reports no tasks were run.`,
+    };
+  }
+
+  // --- Build/test evidence: run available scripts ---
+  const scripts = await buildTool.availableScripts(runtime.workspaceRoot);
+  for (const scriptName of ["build", "test"] as const) {
+    if (!scripts.includes(scriptName)) continue;
+    const result = await buildTool.runScript(scriptName, runtime.workspaceRoot);
+    if (result.code !== 0) {
+      await recordAnomaly(
+        runtime,
+        "slice-no-evidence",
+        "error",
+        `Slice ${sliceId} evidence gate: '${scriptName}' script failed (exit ${result.code}) after done-check PASS.`,
+        { sliceId, phase, script: scriptName, exitCode: result.code, stderr: result.stderr.slice(0, 400) },
+      );
+      return {
+        status: "FAIL",
+        reason:
+          `Slice ${sliceId} evidence gate: npm ${scriptName} exited ${result.code}. ${result.stderr.slice(0, 200)}`.trim(),
+      };
+    }
+  }
+
+  void signal; // signal intentionally unused here — build scripts are short
+
+  return { status: "PASS", reason: "" };
 }

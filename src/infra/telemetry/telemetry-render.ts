@@ -13,6 +13,9 @@ export function renderRunLog(runId: string, state: RunState, events: TelemetryEv
   const failureRows = events.filter(isFailureOrLoopEvent).map(renderFailureRow);
   const currentSignal = state.nextStage === "done" ? "Run complete." : `Next stage: ${state.nextStage}.`;
 
+  const anomalyEvents = events.filter((e) => e.event_type === "pipeline.anomaly");
+  const anomalyRows = anomalyEvents.map(renderAnomalyRow);
+
   return [
     `# Run Log — ${runId}`,
     "",
@@ -50,6 +53,12 @@ export function renderRunLog(runId: string, state: RunState, events: TelemetryEv
     "| Type | Stage | Phase | Round | Summary | Artifact |",
     "| ---- | ----- | ----- | ----- | ------- | -------- |",
     ...(failureRows.length > 0 ? failureRows : ["_(Empty when no failures or loops have occurred.)_"]),
+    "",
+    "## Anomalies",
+    "",
+    "| Time (UTC) | Severity | Code | Stage | Summary |",
+    "| ---------- | -------- | ---- | ----- | ------- |",
+    ...(anomalyRows.length > 0 ? anomalyRows : ["| — | — | — | — | No anomalies recorded. |"]),
     "",
     "## Artifact Index",
     "",
@@ -162,7 +171,11 @@ function resolveRunStatus(events: TelemetryEvent[], finished: string | undefined
 }
 
 function isFailureOrLoopEvent(event: TelemetryEvent): boolean {
-  return event.event_type.startsWith("backward_loop") || event.event_type === "stage.failed";
+  return (
+    event.event_type.startsWith("backward_loop") ||
+    event.event_type === "stage.failed" ||
+    event.event_type === "pipeline.anomaly"
+  );
 }
 
 function renderTimelineRow(event: TelemetryEvent): string {
@@ -171,8 +184,18 @@ function renderTimelineRow(event: TelemetryEvent): string {
   return `| ${timeOnly(event.ts)} | ${event.sequence} | ${scope} | ${event.event_type} | ${event.status} | ${event.summary} | ${artifacts} |`;
 }
 
+function renderAnomalyRow(event: TelemetryEvent): string {
+  const code = (event.context?.["code"] as string | undefined) ?? "unknown";
+  const severity = (event.context?.["severity"] as string | undefined) ?? "error";
+  return `| ${timeOnly(event.ts)} | ${severity} | ${code} | ${event.stage ?? "—"} | ${event.summary} |`;
+}
+
 function renderFailureRow(event: TelemetryEvent): string {
-  const type = event.event_type.startsWith("backward_loop") ? "backward_loop" : event.event_type;
+  const type = event.event_type.startsWith("backward_loop")
+    ? "backward_loop"
+    : event.event_type === "pipeline.anomaly"
+      ? `anomaly:${(event.context?.["code"] as string | undefined) ?? "unknown"}`
+      : event.event_type;
   const artifact = event.artifacts?.[0] ?? "—";
   return `| ${type} | ${event.stage ?? "—"} | ${event.phase ?? "—"} | ${event.review_round ?? "—"} | ${event.summary} | ${artifact} |`;
 }

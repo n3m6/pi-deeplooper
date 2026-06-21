@@ -12,6 +12,7 @@ import type {
   GateApproved,
   GatePresented,
   GateRejected,
+  PipelineAnomaly,
   RequeueDecided,
   RequeueExhausted,
   RequeueRequested,
@@ -78,6 +79,8 @@ export function domainEventToTelemetryEvent(event: DomainEvent): TelemetryEventP
       // Dispatch events are persisted for audit but excluded from the timeline/run-log
       // (they are already aggregated via child_agent_calls in stage context).
       return mapDispatchEvent(event);
+    case "pipeline.anomaly":
+      return mapPipelineAnomalyEvent(event);
     default:
       return undefined;
   }
@@ -346,6 +349,20 @@ function mapSliceEvent(event: SliceEvent): TelemetryEventPartial {
         context: { sliceId: event.sliceId, requeueCount: event.requeueCount },
       };
   }
+}
+
+function mapPipelineAnomalyEvent(event: PipelineAnomaly): TelemetryEventPartial {
+  const status = event.severity === "error" ? "FAIL" : event.severity === "warning" ? "PARTIAL" : "PASS";
+  return {
+    event_type: "pipeline.anomaly",
+    status,
+    route: event.route,
+    ...(event.stage !== undefined ? { stage: event.stage } : {}),
+    summary: `[${event.code}] ${event.summary}`,
+    ...(event.context !== undefined
+      ? { context: { code: event.code, severity: event.severity, ...event.context } }
+      : { context: { code: event.code, severity: event.severity } }),
+  };
 }
 
 function mapDispatchEvent(event: DispatchStarted | DispatchCompleted): TelemetryEventPartial {

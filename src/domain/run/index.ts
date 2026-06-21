@@ -173,6 +173,16 @@ export class Run {
     this._state = next;
   }
 
+  setLastBackwardLoopFingerprint(fingerprint: string | undefined): void {
+    const next = { ...this._state, updatedAt: new Date().toISOString() };
+    if (fingerprint !== undefined) {
+      next.lastBackwardLoopFingerprint = fingerprint;
+    } else {
+      delete next.lastBackwardLoopFingerprint;
+    }
+    this._state = next;
+  }
+
   // ---------------------------------------------------------------------------
   // Backward-loop caps
   // ---------------------------------------------------------------------------

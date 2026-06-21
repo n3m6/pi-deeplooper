@@ -183,6 +183,31 @@ export function dispatchFailureSummary(result: DispatchResult, label: string): s
 export { parseReviewStatus, extractFixGuidance, parseMarkdownSections };
 
 /**
+ * Emit a pipeline.anomaly event for a silent degradation that would otherwise leave
+ * no trace in telemetry (e.g. empty parse results, vacuous done-checks, no-progress loops).
+ *
+ * Stable codes: design-slices-unparsed, slice-no-evidence, done-check-vacuous,
+ * slice-plan-empty, backward-loop-no-progress, skeleton-scaffold-missing.
+ */
+export async function recordAnomaly(
+  runtime: StageRuntime,
+  code: string,
+  severity: "info" | "warning" | "error",
+  summary: string,
+  context?: Record<string, unknown>,
+): Promise<void> {
+  await runtime.services.telemetrySink.record({
+    type: "pipeline.anomaly",
+    code,
+    severity,
+    route: runtime.state.route,
+    ...(runtime.currentStage !== undefined ? { stage: runtime.currentStage } : {}),
+    summary,
+    ...(context !== undefined ? { context } : {}),
+  });
+}
+
+/**
  * Returns true for dispatch failures that are safe to retry (transient infrastructure issues).
  * `timeout` and `session_error` are transient; `aborted` and `max_turns` are not.
  */

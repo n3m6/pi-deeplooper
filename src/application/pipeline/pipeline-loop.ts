@@ -17,6 +17,7 @@
  */
 
 import { Run, MAX_BACKWARD_LOOPS } from "../../domain/run/index.js";
+import { SliceQueue } from "../../domain/slice/slice-queue.js";
 import { escalationTarget } from "../../domain/backward-loop/artifact-reset-policy.js";
 import type { StageContext } from "../../domain/event/index.js";
 import { baselineStage } from "../stage/baseline.js";
@@ -43,6 +44,32 @@ const STAGES: Record<StageName, StageModule> = {
   accept: acceptStage,
   report: reportStage,
 };
+
+/**
+ * Build a stable fingerprint for a backward-loop escalation. Two escalations with the
+ * same fingerprint represent a fixed point: re-running the target stage will produce the
+ * same result, so we should stop rather than thrash.
+ *
+ * The "normalized reason" strips timestamps, slice counts, and other transient parts so
+ * that trivially-different messages don't create false negatives.
+ */
+function buildBackwardLoopFingerprint(
+  sliceId: string,
+  classification: string,
+  reason: string,
+  actionableSliceCount: number,
+): string {
+  // Normalize the reason: lowercase, collapse whitespace, strip numbers and punctuation
+  // that may vary between runs while the core problem is the same.
+  const normalized = reason
+    .toLowerCase()
+    .replace(/\d+/g, "N")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  return `${sliceId}:${classification}:${normalized}:${actionableSliceCount}`;
+}
 
 export async function runPipeline(options: {
   services: PipelineServices;
@@ -110,6 +137,41 @@ export async function runPipeline(options: {
       if (outcome.backwardLoop) {
         await sink.record({ type: "backward_loop.requested", ...stageCtx, request: outcome.backwardLoop });
 
+        // No-progress detection: compute a fingerprint of this escalation and compare
+        // with the previous one. If they match, re-running design will produce the same
+        // result — stop early with a precise diagnosis rather than burning the budget.
+        const queueMd = await services.artifactRepo.read({ kind: "sliceQueue" });
+        const actionableSliceCount = queueMd
+          ? SliceQueue.parse(queueMd).slices.filter((s) => s.status === "ready" || s.status === "building").length
+          : 0;
+        const fingerprint = buildBackwardLoopFingerprint(
+          run.state.currentSlice ?? "none",
+          outcome.backwardLoop.classification,
+          outcome.backwardLoop.summary,
+          actionableSliceCount,
+        );
+        const isFixedPoint = run.state.lastBackwardLoopFingerprint === fingerprint;
+
+        if (isFixedPoint) {
+          await sink.record({
+            type: "pipeline.anomaly",
+            code: "backward-loop-no-progress",
+            severity: "error",
+            stage: stage.stage,
+            route: run.state.route,
+            summary: `Backward-loop escalation is a fixed point (fingerprint unchanged): re-running ${escalationTarget(outcome.backwardLoop.classification)} would produce the same inputs. Stopping to avoid thrash.`,
+            context: { fingerprint, classification: outcome.backwardLoop.classification },
+          });
+          await sink.record({
+            type: "backward_loop.failed",
+            ...stageCtx,
+            classification: outcome.backwardLoop.classification,
+            maxLoops: MAX_BACKWARD_LOOPS,
+          });
+          await services.stateRepo.save(run);
+          break;
+        }
+
         if (run.isBackwardLoopCapHit()) {
           await sink.record({
             type: "backward_loop.failed",
@@ -123,6 +185,7 @@ export async function runPipeline(options: {
 
         const target = escalationTarget(outcome.backwardLoop.classification);
         run.incrementBackwardLoops();
+        run.setLastBackwardLoopFingerprint(fingerprint);
         // Signal slice-loop to reconcile the queue when it re-enters after design.
         if (target === "design" || target === "goals") {
           run.setPendingReconcile(true);

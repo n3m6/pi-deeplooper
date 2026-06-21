@@ -110,6 +110,13 @@ export interface RunState {
    * re-entering from a Design/Goals escalation.
    */
   pendingReconcile?: boolean;
+  /**
+   * Fingerprint of the last backward-loop escalation. Used to detect no-progress
+   * fixed points where re-running design produces the same inputs and the loop
+   * would burn the budget without making progress.
+   * Format: "<sliceId>:<classification>:<normalizedReason>:<actionableSliceCount>"
+   */
+  lastBackwardLoopFingerprint?: string;
 }
 
 export interface ExplicitRunOptions {

@@ -190,3 +190,88 @@ export function parseAffectedArtifact(markdown: string): "design" | "structure" 
   const raw = markdown.match(/\*\*Affected Artifact\*\*:\s*(design|structure|plan)/i)?.[1]?.toLowerCase();
   return raw === "design" ? "design" : raw === "structure" ? "structure" : "plan";
 }
+
+// ---------------------------------------------------------------------------
+// Slice Manifest — machine-readable contract in design.md
+// ---------------------------------------------------------------------------
+
+export interface SliceManifestEntry {
+  id: string;
+  title: string;
+  deps: string[];
+  acceptanceCriteria: string[];
+}
+
+export type SliceManifestResult = { ok: true; slices: SliceManifestEntry[] } | { ok: false; reason: string };
+
+/**
+ * Extract and validate the `## Slice Manifest` JSON block from a design.md document.
+ * Returns `{ ok: false }` when the section is absent or the JSON is malformed/invalid.
+ */
+export function parseSliceManifest(designMd: string): SliceManifestResult {
+  // Find the ## Slice Manifest section and extract the first fenced JSON block within it.
+  const topSections = normalizeNewlines(designMd).split(/^## /m);
+  const manifestSection = topSections.find((s) => s.match(/^Slice Manifest\b/));
+  if (!manifestSection) {
+    return { ok: false, reason: "## Slice Manifest section not found in design.md" };
+  }
+
+  const jsonMatch = manifestSection.match(/```json\s*\n([\s\S]*?)\n```/);
+  if (!jsonMatch || !jsonMatch[1]) {
+    return { ok: false, reason: "No ```json fenced block found in ## Slice Manifest section" };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonMatch[1]);
+  } catch (e) {
+    return { ok: false, reason: `JSON parse error in ## Slice Manifest: ${String(e)}` };
+  }
+
+  if (!validateSliceManifest(parsed)) {
+    return {
+      ok: false,
+      reason: "## Slice Manifest JSON does not match expected schema {slices:[{id,title,deps,acceptanceCriteria}]}",
+    };
+  }
+
+  const manifest = parsed as { slices: SliceManifestEntry[] };
+
+  for (const slice of manifest.slices) {
+    if (!/^[A-Za-z0-9_-]+$/.test(slice.id)) {
+      return {
+        ok: false,
+        reason: `Slice manifest entry has invalid id "${slice.id}" — must be alphanumeric/dash/underscore with no spaces`,
+      };
+    }
+    if (slice.acceptanceCriteria.length === 0) {
+      return { ok: false, reason: `Slice manifest entry "${slice.id}" has an empty acceptanceCriteria array` };
+    }
+  }
+
+  return { ok: true, slices: manifest.slices };
+}
+
+/**
+ * Returns true when design.md declares any slices (i.e. contains `## Slice Manifest` or
+ * `## Vertical Slices`). Used to distinguish "no slices intended" from "slices declared
+ * but unparseable".
+ */
+export function designDeclaresSlices(designMd: string): boolean {
+  return /^## Slice Manifest\b/m.test(designMd) || /^## Vertical Slices\b/m.test(designMd);
+}
+
+function validateSliceManifest(value: unknown): value is { slices: unknown[] } {
+  if (typeof value !== "object" || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  if (!Array.isArray(obj["slices"])) return false;
+  for (const item of obj["slices"]) {
+    if (typeof item !== "object" || item === null) return false;
+    const s = item as Record<string, unknown>;
+    if (typeof s["id"] !== "string") return false;
+    if (typeof s["title"] !== "string") return false;
+    if (!Array.isArray(s["deps"])) return false;
+    if (!Array.isArray(s["acceptanceCriteria"])) return false;
+  }
+  return true;
+}
