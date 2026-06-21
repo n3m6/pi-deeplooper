@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { FileSystemArtifactRepository, ensureRunDirectories, getRunArtifacts } from "./infra/fs/artifact-repository.js";
 import { FileSystemRunStateRepository } from "./infra/fs/state-repository.js";
@@ -20,15 +20,25 @@ import { LiveActivityPresenter } from "./infra/pi/live-activity-presenter.js";
 import { ConfiguredModelPolicy } from "./infra/pi/model-policy.js";
 import { loadModelConfig, resolveProfile } from "./infra/config/model-config.js";
 import { CassetteWriter, CASSETTE_SCHEMA_VERSION, type CassetteMeta } from "./infra/replay/cassette.js";
-import { RecordingDispatcher, type WorkspaceCapture } from "./infra/replay/recording-dispatcher.js";
+import { createGitWorkspaceCapture } from "./infra/replay/git-workspace-capture.js";
+import { RecordingDispatcher } from "./infra/replay/recording-dispatcher.js";
 import { RecordingGateManager } from "./infra/replay/recording-gate.js";
 import { JsonlTelemetrySink } from "./infra/telemetry/jsonl-telemetry-sink.js";
 import { TimestampIdGenerator } from "./infra/system/id-generator.js";
 import { SystemClock } from "./infra/system/clock.js";
 import { Run } from "./domain/run/index.js";
 import { runPipeline } from "./application/pipeline/run-pipeline.js";
-import type { Dispatcher, GateManager, PipelineServices } from "./application/port/index.js";
+import type { Dispatcher, GateManager, ModelPolicy, PipelineServices, RunState } from "./application/port/index.js";
 
+/** Resolved interaction settings for a run (mode, failure policy, review depth, explicit flags). */
+type InteractionResolution = ReturnType<typeof determineInteractionMode>;
+
+/**
+ * Extension entry point. Registers the transcript breadcrumb renderer and the `/deeplooper`
+ * command; the command handler is the composition root that wires every port and runs the
+ * pipeline. Keeping the handler a thin sequence of named phases is intentional — the heavy
+ * lifting lives in the helpers below and in the infra adapters.
+ */
 export default function (pi: ExtensionAPI): void {
   // Register the transcript breadcrumb renderer once at extension load time.
   pi.registerMessageRenderer(DEEPLOOPER_PROGRESS_CUSTOM_TYPE, DEEPLOOPER_PROGRESS_RENDERER);
@@ -37,36 +47,32 @@ export default function (pi: ExtensionAPI): void {
     description: "Run the deterministic DEEPLOOPER vertical-slice pipeline.",
     handler: async (args, ctx) => {
       await ctx.waitForIdle();
-      const interaction = determineInteractionMode(ctx, args);
-      const clock = new SystemClock();
-      const runId = interaction.explicit.resumeRunId ?? new TimestampIdGenerator().runId();
-      const userTask = interaction.explicit.resumeRunId ? undefined : stripCommandFlags(args).trim();
 
-      const agentCatalog = await MarkdownAgentCatalog.load();
-      const agentDefinitions = agentCatalog.all();
+      // ── Phase 1: resolve run identity and interaction settings from the command args ──
+      const { interaction, clock, runId, userTask } = resolveRunInputs(ctx, args);
 
-      // Construct the presenter once; shared by the sink and dispatcher.
+      // ── Phase 2: load leaf-agent catalog, UI presenter, and per-tier model routing ──
+      const agentDefinitions = (await MarkdownAgentCatalog.load()).all();
+      // The presenter is constructed once and shared by both the dispatcher and the telemetry sink.
       const presenter = ctx.hasUI ? new LiveActivityPresenter(ctx) : undefined;
+      const modelPolicy = await buildModelPolicy(ctx, interaction);
 
-      const modelConfig = await loadModelConfig(ctx.cwd, (msg) => ctx.ui.notify(msg, "warning"));
-      const activeProfileName = interaction.explicit.modelProfile ?? modelConfig.profile;
-      const activeProfile = resolveProfile(modelConfig, activeProfileName);
-      const modelPolicy = new ConfiguredModelPolicy(activeProfile);
-
-      let dispatcher: Dispatcher = new PiSessionDispatcher(
+      // ── Phase 3: construct the base ports the pipeline drives ──
+      const baseDispatcher: Dispatcher = new PiSessionDispatcher(
         ctx.modelRegistry,
         ctx.model,
         undefined,
         presenter,
         modelPolicy,
       );
-      let gates: GateManager = new DefaultGateManager(ctx, {
+      const baseGates: GateManager = new DefaultGateManager(ctx, {
         interactionMode: interaction.interactionMode,
         failurePolicy: interaction.failurePolicy,
         reviewDepth: interaction.reviewDepth,
       });
       const progress = new UiProgressReporter(ctx);
 
+      // ── Phase 4: recover prior state (resume) or seed a fresh run, and ensure artifact dirs ──
       const resumedState = await resumeOrInferState({
         workspaceRoot: ctx.cwd,
         runId,
@@ -76,51 +82,17 @@ export default function (pi: ExtensionAPI): void {
       const artifacts = getRunArtifacts(ctx.cwd, runId);
       await ensureRunDirectories(artifacts);
 
-      // Env-gated recording: set DEEPLOOPER_RECORD=<dir> or DEEPLOOPER_RECORD=1 (→ <runDir>/cassette/)
-      const recordEnv = process.env["DEEPLOOPER_RECORD"];
-      let cassetteWriter: CassetteWriter | undefined;
-      if (recordEnv) {
-        cassetteWriter = new CassetteWriter();
-        const capture: WorkspaceCapture = {
-          async snapshot(cwd: string): Promise<string> {
-            await pi.exec("git", ["-C", cwd, "add", "-A"], { cwd, timeout: 30_000 });
-            const result = await pi.exec("git", ["-C", cwd, "write-tree"], { cwd, timeout: 30_000 });
-            await pi.exec("git", ["-C", cwd, "reset"], { cwd, timeout: 30_000 });
-            return result.stdout.trim();
-          },
-          async diff(
-            cwd: string,
-            handle: string,
-          ): Promise<{ files: Array<{ path: string; content: string }>; patch: string }> {
-            if (!handle) return { files: [], patch: "" };
-            const { readFile } = await import("node:fs/promises");
-            await pi.exec("git", ["-C", cwd, "add", "-A"], { cwd, timeout: 30_000 });
-            const nameResult = await pi.exec(
-              "git",
-              ["-C", cwd, "diff", "--cached", handle, "--name-only", "--diff-filter=AM"],
-              { cwd, timeout: 30_000 },
-            );
-            const patchResult = await pi.exec("git", ["-C", cwd, "diff", "--cached", handle], { cwd, timeout: 30_000 });
-            await pi.exec("git", ["-C", cwd, "reset"], { cwd, timeout: 30_000 });
-            const relPaths = nameResult.stdout
-              .split("\n")
-              .map((l) => l.trim())
-              .filter(Boolean);
-            const files: Array<{ path: string; content: string }> = [];
-            for (const relPath of relPaths) {
-              try {
-                const content = await readFile(`${cwd}/${relPath}`, "utf8");
-                files.push({ path: relPath, content });
-              } catch {
-                /* unreadable — skip */
-              }
-            }
-            return { files, patch: patchResult.stdout };
-          },
-        };
-        dispatcher = new RecordingDispatcher(dispatcher, cassetteWriter, ctx.cwd, runId, capture);
-        gates = new RecordingGateManager(gates, cassetteWriter);
-      }
+      // ── Phase 5: optionally wrap dispatcher/gates for record/replay (gated by DEEPLOOPER_RECORD) ──
+      const recording = setupRecording({
+        pi,
+        dispatcher: baseDispatcher,
+        gates: baseGates,
+        cwd: ctx.cwd,
+        runId,
+        runDir: artifacts.runDir,
+        interaction,
+        userTask,
+      });
 
       const initialRun = resumedState
         ? Run.rehydrate(resumedState)
@@ -131,32 +103,30 @@ export default function (pi: ExtensionAPI): void {
             ...(userTask ? { userTask } : {}),
           });
 
-      const artifactRepo = FileSystemArtifactRepository.fromPaths(artifacts);
-      const versionControl = new GitVersionControl(pi, ctx.cwd, runId);
-      const buildTool = new NpmBuildTool(pi);
+      // ── Phase 6: wire the remaining infrastructure adapters into the services bundle ──
+      // The live sink mirrors JSONL telemetry to the UI; held as a concrete ref so we can initialize it.
       const jsonlSink = JsonlTelemetrySink.create(artifacts, runId, clock);
       const telemetrySink = new LiveUiTelemetrySink(jsonlSink, pi, ctx, presenter);
-      const stateRepo = new FileSystemRunStateRepository(artifacts.stateFile);
-
       const services: PipelineServices = {
         commandContext: { signal: ctx.signal },
         eventContext: { signal: ctx.signal },
-        dispatcher,
+        dispatcher: recording.dispatcher,
         agentDefinitions,
-        gates,
+        gates: recording.gates,
         progress,
         clock,
-        artifactRepo,
-        versionControl,
-        buildTool,
+        artifactRepo: FileSystemArtifactRepository.fromPaths(artifacts),
+        versionControl: new GitVersionControl(pi, ctx.cwd, runId),
+        buildTool: new NpmBuildTool(pi),
         telemetrySink,
-        stateRepo,
+        stateRepo: new FileSystemRunStateRepository(artifacts.stateFile),
       };
 
       await telemetrySink.initialize();
       presenter?.start();
 
-      let finalState: Awaited<ReturnType<typeof runPipeline>> | undefined;
+      // ── Phase 7: run the pipeline, always stopping the presenter and flushing the cassette ──
+      let finalState: RunState | undefined;
       try {
         finalState = await runPipeline({
           services,
@@ -167,25 +137,98 @@ export default function (pi: ExtensionAPI): void {
         ctx.ui.notify(`Deeplooper run ${runId} finished at stage ${finalState.lastCompletedStage}.`, "info");
       } finally {
         presenter?.stop();
-        if (cassetteWriter) {
-          const cassetteDir = recordEnv === "1" ? path.join(artifacts.runDir, "cassette") : (recordEnv ?? "cassette");
-          const meta: CassetteMeta = {
-            schemaVersion: CASSETTE_SCHEMA_VERSION,
-            runId,
-            route: finalState?.route ?? "full",
-            interactionMode: interaction.interactionMode,
-            failurePolicy: interaction.failurePolicy,
-            userTask: userTask ?? "",
-            reviewDepth: interaction.reviewDepth,
-            ...(interaction.explicit.modelProfile !== undefined
-              ? { modelProfile: interaction.explicit.modelProfile }
-              : {}),
-          };
-          await cassetteWriter.flush(cassetteDir, meta);
-        }
+        await recording.flush(finalState);
       }
     },
   });
+}
+
+interface RunInputs {
+  interaction: InteractionResolution;
+  clock: SystemClock;
+  runId: string;
+  userTask: string | undefined;
+}
+
+/**
+ * Derives the run identity from the command invocation. On resume the run-id comes from the
+ * `run-id:` flag and there is no fresh user task; otherwise a timestamped id is minted and the
+ * task text is the args with all control flags stripped out.
+ */
+function resolveRunInputs(ctx: ExtensionCommandContext, args: string): RunInputs {
+  const interaction = determineInteractionMode(ctx, args);
+  const clock = new SystemClock();
+  const runId = interaction.explicit.resumeRunId ?? new TimestampIdGenerator().runId();
+  const userTask = interaction.explicit.resumeRunId ? undefined : stripCommandFlags(args).trim();
+  return { interaction, clock, runId, userTask };
+}
+
+/**
+ * Resolves the active model profile (explicit `models:` flag wins over the config default) and
+ * returns a policy that maps each model tier to a concrete model + thinking level.
+ */
+async function buildModelPolicy(
+  ctx: ExtensionCommandContext,
+  interaction: InteractionResolution,
+): Promise<ModelPolicy> {
+  const modelConfig = await loadModelConfig(ctx.cwd, (msg) => ctx.ui.notify(msg, "warning"));
+  const activeProfileName = interaction.explicit.modelProfile ?? modelConfig.profile;
+  const activeProfile = resolveProfile(modelConfig, activeProfileName);
+  return new ConfiguredModelPolicy(activeProfile);
+}
+
+interface RecordingSetup {
+  dispatcher: Dispatcher;
+  gates: GateManager;
+  /** Persists the cassette once the run finishes. A no-op when recording is disabled. */
+  flush(finalState: RunState | undefined): Promise<void>;
+}
+
+/**
+ * Env-gated record/replay wiring. When DEEPLOOPER_RECORD is set, the dispatcher and gate
+ * manager are wrapped so every dispatch and gate decision is captured into a cassette, and the
+ * returned `flush` writes that cassette on completion. When unset, the inputs are returned
+ * untouched alongside a no-op flush so the caller stays branch-free.
+ *
+ *   DEEPLOOPER_RECORD=1      → cassette written to <runDir>/cassette/
+ *   DEEPLOOPER_RECORD=<dir>  → cassette written to <dir>
+ */
+function setupRecording(params: {
+  pi: ExtensionAPI;
+  dispatcher: Dispatcher;
+  gates: GateManager;
+  cwd: string;
+  runId: string;
+  runDir: string;
+  interaction: InteractionResolution;
+  userTask: string | undefined;
+}): RecordingSetup {
+  const { pi, dispatcher, gates, cwd, runId, runDir, interaction, userTask } = params;
+
+  const recordEnv = process.env["DEEPLOOPER_RECORD"];
+  if (!recordEnv) {
+    return { dispatcher, gates, flush: async () => {} };
+  }
+
+  const writer = new CassetteWriter();
+  return {
+    dispatcher: new RecordingDispatcher(dispatcher, writer, cwd, runId, createGitWorkspaceCapture(pi)),
+    gates: new RecordingGateManager(gates, writer),
+    async flush(finalState) {
+      const cassetteDir = recordEnv === "1" ? path.join(runDir, "cassette") : recordEnv;
+      const meta: CassetteMeta = {
+        schemaVersion: CASSETTE_SCHEMA_VERSION,
+        runId,
+        route: finalState?.route ?? "full",
+        interactionMode: interaction.interactionMode,
+        failurePolicy: interaction.failurePolicy,
+        userTask: userTask ?? "",
+        reviewDepth: interaction.reviewDepth,
+        ...(interaction.explicit.modelProfile !== undefined ? { modelProfile: interaction.explicit.modelProfile } : {}),
+      };
+      await writer.flush(cassetteDir, meta);
+    },
+  };
 }
 
 export function stripCommandFlags(args: string): string {
