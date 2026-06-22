@@ -83,4 +83,13 @@ export class FakeVersionControl implements VersionControl {
   cleanupWorktree(_worktree: TaskWorktreeHandle, _signal?: AbortSignal): Promise<void> {
     return Promise.resolve();
   }
+
+  stage7RegressionReusable(_signal?: AbortSignal): Promise<{ reusable: boolean; reason: string }> {
+    // Mirrors the real implementation's no-phase-commit reason so the verifier prompt hashes
+    // identically between recording (empty git repo) and pure-mode replay.
+    return Promise.resolve({
+      reusable: false,
+      reason: "no-phase-commit: no deeplooper phase commit found; running full suite",
+    });
+  }
 }

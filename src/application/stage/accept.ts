@@ -13,7 +13,7 @@
  */
 
 import { SliceQueue } from "../../domain/slice/slice-queue.js";
-import { parseMarkdownSections } from "../../infra/codec/markdown-codec.js";
+import { parseBlockedCriteria, parseMarkdownSections } from "../../infra/codec/markdown-codec.js";
 import type { ArtifactId, StageModule, StageOutcome, StageRuntime } from "../port/index.js";
 import {
   appendReflectorLessons,
@@ -21,6 +21,7 @@ import {
   dispatchGenericCoding,
   dispatchLeaf,
   readArtifact,
+  recordAnomaly,
   safeReadArtifact,
   writeArtifact,
 } from "./utils.js";
@@ -84,6 +85,20 @@ export const acceptStage: StageModule = {
     await writeArtifact(runtime, coveragePlanId, coveragePlan.text);
     const filesWritten: string[] = [artifactRelPath(runtime, coveragePlanId)];
 
+    // Parse criteria the planner has marked as blocked/out-of-scope so we can
+    // instruct the coding agent not to author tests for them.
+    const blockedCriteria = parseBlockedCriteria(coveragePlan.text);
+    const blockedBlock =
+      blockedCriteria.length > 0
+        ? [
+            "",
+            "The following criteria are marked BLOCKED/OUT-OF-SCOPE by the coverage planner.",
+            "Do NOT author or run tests for these criteria. Record them as intentionally uncovered",
+            "with status OUT_OF_SCOPE in global-acceptance-results.md:",
+            ...blockedCriteria.map((c, i) => `  ${String(i + 1)}. ${c}`),
+          ].join("\n")
+        : "";
+
     // 2. Run acceptance tests via generic coding agent.
     let acceptanceOutcome: StageOutcome = {
       status: "FAIL",
@@ -99,6 +114,7 @@ export const acceptStage: StageModule = {
           "Only create or update acceptance/integration/e2e test files. Do not modify production code.",
           "Use the global coverage plan, slice queue, and goals as the contract.",
           "Run the relevant project tests, then return with stage_return.",
+          blockedBlock,
           "",
           "Required outputs:",
           "- Write needed test files under the workspace.",
@@ -108,7 +124,9 @@ export const acceptStage: StageModule = {
           `Coverage plan: ${repo.resolvePath(coveragePlanId)}`,
           "",
           "Return telemetry.evidence_quality with counts.",
-        ].join("\n"),
+        ]
+          .filter(Boolean)
+          .join("\n"),
         { cwd: runtime.workspaceRoot },
       );
       if (acceptanceOutcome.status === "PASS" || round === MAX_ACCEPTANCE_LOOP_ROUNDS) {
@@ -170,9 +188,30 @@ export const acceptStage: StageModule = {
     // the queue (pattern B). Remediation slices are returned as `### R-NNN: <title>`
     // sections; remediation is "added" (or an existing done slice is reopened) only when
     // the queue actually changes. Prefer reopening a falsely-done slice over adding R-NNN.
+    //
+    // Process/meta criteria (e.g. "git commit exists") are filtered out: only criteria
+    // that trace to a known acceptance criterion in the queue are allowed through.
     const reflectSections = parseMarkdownSections(reflect.text);
     const existingQueue = sliceQueueMd ? SliceQueue.parse(sliceQueueMd) : SliceQueue.empty();
-    const { queue: updatedQueue, reopened, added } = existingQueue.applyRemediationFromMarkdown(reflect.text);
+    const knownCriteria = new Set(existingQueue.allAcceptanceCriteria());
+    const allowCriterion = (ac: string) => knownCriteria.has(ac.trim()) || knownCriteria.has(ac);
+    const {
+      queue: updatedQueue,
+      reopened,
+      added,
+      dropped,
+    } = existingQueue.applyRemediationFromMarkdown(reflect.text, allowCriterion);
+    if (dropped.length > 0) {
+      await recordAnomaly(
+        runtime,
+        "remediation-criteria-filtered",
+        "warning",
+        `dl-reflector proposed ${String(dropped.length)} remediation criterion/criteria that do not trace to any ` +
+          `known acceptance criterion in the slice queue. They were dropped to prevent process/meta criteria ` +
+          `from entering the queue.`,
+        { dropped },
+      );
+    }
     const remediationSlicesAdded = reopened.length > 0 || added.length > 0;
 
     if (remediationSlicesAdded) {

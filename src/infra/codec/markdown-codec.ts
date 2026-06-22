@@ -302,6 +302,176 @@ export function designDeclaresSlices(designMd: string): boolean {
   return /^## Slice Manifest\b/m.test(designMd) || /^## Vertical Slices\b/m.test(designMd);
 }
 
+// ---------------------------------------------------------------------------
+// Coverage-plan parser helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse criteria marked as `Action: blocked` from a global-coverage-plan.md document.
+ * Returns a list of criterion description strings that the planner has marked as blocked/out-of-scope.
+ *
+ * Expected pipe-table format (from dl-coverage-planner):
+ *   | # | Criterion | Test file | Action | Notes |
+ *   | 1 | some text | — | blocked | reason |
+ */
+export function parseBlockedCriteria(coveragePlanMd: string): string[] {
+  const rows = parsePipeTable(coveragePlanMd);
+  if (rows.length < 2) return [];
+
+  // Find header row indices.
+  const header = rows[0];
+  if (!header) return [];
+  const criterionIdx = header.findIndex((h) => /criterion/i.test(h));
+  const actionIdx = header.findIndex((h) => /action/i.test(h));
+  if (criterionIdx === -1 || actionIdx === -1) return [];
+
+  const blocked: string[] = [];
+  for (const row of rows.slice(1)) {
+    const action = row[actionIdx]?.trim().toLowerCase() ?? "";
+    if (action === "blocked") {
+      const criterion = row[criterionIdx]?.trim();
+      if (criterion) blocked.push(criterion);
+    }
+  }
+  return blocked;
+}
+
+// ---------------------------------------------------------------------------
+// Agent-section normalization helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a raw agent section value by:
+ *   1. Normalizing newlines.
+ *   2. Stripping any lone ``` fence lines that appear at the very start or end
+ *      of the string (the exact stray-fence pattern agents emit when they wrap
+ *      a section body in a code block they forget to close, or vice-versa).
+ *      Inner fenced blocks (e.g. ```typescript ... ```) are left untouched.
+ *   3. Trimming leading/trailing whitespace.
+ *
+ * This is the canonical normalizer for every reflector/synthesizer section
+ * before the controller decides whether to persist it.
+ */
+export function normalizeAgentSection(raw: string): string {
+  const normalized = normalizeNewlines(raw);
+  const lines = normalized.split("\n");
+
+  // Count fence depth: each line starting with ``` toggles the depth counter.
+  let depth = 0;
+  for (const line of lines) {
+    if (line.startsWith("```")) depth ^= 1;
+  }
+
+  // If unbalanced, strip the last lone ``` line (the stray trailing token).
+  if (depth !== 0) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if ((lines[i] ?? "").startsWith("```")) {
+        lines.splice(i, 1);
+        break;
+      }
+    }
+  }
+
+  return lines.join("\n").trim();
+}
+
+/**
+ * Returns true when a (possibly already normalized) agent section value should
+ * be treated as "nothing to record" — i.e. the agent returned "None." or an
+ * equivalent empty/whitespace-only value.
+ */
+export function isEmptySectionValue(normalized: string): boolean {
+  return normalized.trim() === "" || /^none\.?$/i.test(normalized.trim());
+}
+
+// ---------------------------------------------------------------------------
+// Done Checklist parser
+// ---------------------------------------------------------------------------
+
+/** A single parsed done-checklist item from a task spec's ## Done Checklist section. */
+export type DoneChecklistItem =
+  | { kind: "file-exists"; path: string }
+  | { kind: "symbol-exists"; symbol: string; path: string }
+  | { kind: "command-exits-0"; command: string }
+  | { kind: "test-passes"; description: string };
+
+export interface ParsedDoneChecklist {
+  items: DoneChecklistItem[];
+  /** Items whose prefix was not one of the four supported kinds. */
+  unsupportedLines: string[];
+}
+
+/**
+ * Parse the `## Done Checklist` section of a task spec markdown document.
+ * Returns all recognized items and collects any unrecognized lines so callers
+ * can log them as anomalies without silently skipping them.
+ *
+ * Supported item formats (from dl-done-checker contract):
+ *   `file-exists: <path>`
+ *   `symbol-exists: <Symbol> in <path>`
+ *   `command-exits-0: <cmd>`
+ *   `test-passes: <cmd or test name>`
+ */
+export function parseDoneChecklist(taskSpecMd: string): ParsedDoneChecklist {
+  const normalized = normalizeNewlines(taskSpecMd);
+
+  // Extract the ## Done Checklist section body by splitting on `## ` headings.
+  // Split on lines that start a ## section, then find the Done Checklist piece.
+  const chunks = normalized.split(/^(?=## )/m);
+  const doneChunk = chunks.find((c) => c.match(/^## Done Checklist\b/m));
+  if (!doneChunk) {
+    return { items: [], unsupportedLines: [] };
+  }
+  // The body is everything after the first heading line.
+  const headingEnd = doneChunk.indexOf("\n");
+  const sectionBody = headingEnd === -1 ? "" : doneChunk.slice(headingEnd + 1);
+  if (!sectionBody) {
+    return { items: [], unsupportedLines: [] };
+  }
+
+  const items: DoneChecklistItem[] = [];
+  const unsupportedLines: string[] = [];
+
+  for (const rawLine of sectionBody.split("\n")) {
+    // Strip list marker ("- ") and trim.
+    const line = rawLine.replace(/^[-*]\s*/, "").trim();
+    if (!line) continue;
+
+    if (line.startsWith("file-exists:")) {
+      const path = line.slice("file-exists:".length).trim();
+      if (path) items.push({ kind: "file-exists", path });
+      else unsupportedLines.push(line);
+    } else if (line.startsWith("symbol-exists:")) {
+      // Format: `symbol-exists: <Symbol> in <path>`
+      const body = line.slice("symbol-exists:".length).trim();
+      const inIdx = body.lastIndexOf(" in ");
+      if (inIdx !== -1) {
+        const symbol = body.slice(0, inIdx).trim();
+        const path = body.slice(inIdx + 4).trim();
+        if (symbol && path) {
+          items.push({ kind: "symbol-exists", symbol, path });
+        } else {
+          unsupportedLines.push(line);
+        }
+      } else {
+        unsupportedLines.push(line);
+      }
+    } else if (line.startsWith("command-exits-0:")) {
+      const command = line.slice("command-exits-0:".length).trim();
+      if (command) items.push({ kind: "command-exits-0", command });
+      else unsupportedLines.push(line);
+    } else if (line.startsWith("test-passes:")) {
+      const description = line.slice("test-passes:".length).trim();
+      if (description) items.push({ kind: "test-passes", description });
+      else unsupportedLines.push(line);
+    } else {
+      unsupportedLines.push(line);
+    }
+  }
+
+  return { items, unsupportedLines };
+}
+
 function validateSliceManifest(value: unknown): value is { slices: unknown[] } {
   if (typeof value !== "object" || value === null) return false;
   const obj = value as Record<string, unknown>;

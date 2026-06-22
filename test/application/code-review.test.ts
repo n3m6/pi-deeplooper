@@ -129,6 +129,7 @@ function makeVersionControl(changedFiles: string[], changedLines = 250): Version
     changedLineCount: async (_cwd: string) => changedLines,
     listWorkspaceFiles: async (_cwd: string) => changedFiles,
     cleanupWorktree: async () => {},
+    stage7RegressionReusable: async () => ({ reusable: false, reason: "test-stub" }),
   };
 }
 

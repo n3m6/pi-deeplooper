@@ -13,6 +13,10 @@ import {
   parsePipeTable,
   parseSliceManifest,
   designDeclaresSlices,
+  normalizeAgentSection,
+  isEmptySectionValue,
+  parseDoneChecklist,
+  parseBlockedCriteria,
 } from "../../src/infra/codec/markdown-codec.js";
 
 // ---------------------------------------------------------------------------
@@ -318,4 +322,153 @@ test("designDeclaresSlices returns true when ## Vertical Slices is present", () 
 
 test("designDeclaresSlices returns false for design without slice sections", () => {
   assert.ok(!designDeclaresSlices("# Design\n\n## Approach\n\nJust prose.\n"));
+});
+
+// ---------------------------------------------------------------------------
+// normalizeAgentSection
+// ---------------------------------------------------------------------------
+
+test("normalizeAgentSection trims surrounding whitespace", () => {
+  assert.equal(normalizeAgentSection("  hello  "), "hello");
+});
+
+test("normalizeAgentSection strips trailing stray fence after content", () => {
+  const raw = "Some content.\n```";
+  assert.equal(normalizeAgentSection(raw), "Some content.");
+});
+
+test('normalizeAgentSection handles the "None.\\n```" stray fence pattern', () => {
+  const raw = "None.\n```";
+  assert.equal(normalizeAgentSection(raw), "None.");
+});
+
+test("normalizeAgentSection does not strip balanced fences", () => {
+  const raw = "```typescript\nconst x = 1;\n```";
+  assert.equal(normalizeAgentSection(raw), raw);
+});
+
+test("normalizeAgentSection handles multiple balanced fences", () => {
+  const raw = "Before.\n```json\n{}\n```\nAfter.";
+  assert.equal(normalizeAgentSection(raw), raw);
+});
+
+// ---------------------------------------------------------------------------
+// isEmptySectionValue
+// ---------------------------------------------------------------------------
+
+test('isEmptySectionValue returns true for "None."', () => {
+  assert.ok(isEmptySectionValue("None."));
+});
+
+test('isEmptySectionValue returns true for "none"', () => {
+  assert.ok(isEmptySectionValue("none"));
+});
+
+test('isEmptySectionValue returns true for "NONE."', () => {
+  assert.ok(isEmptySectionValue("NONE."));
+});
+
+test("isEmptySectionValue returns true for empty string", () => {
+  assert.ok(isEmptySectionValue(""));
+});
+
+test("isEmptySectionValue returns true for whitespace-only string", () => {
+  assert.ok(isEmptySectionValue("   "));
+});
+
+test("isEmptySectionValue returns false for valid content", () => {
+  assert.ok(!isEmptySectionValue("## FR1\nBuild a server."));
+});
+
+// ---------------------------------------------------------------------------
+// parseDoneChecklist
+// ---------------------------------------------------------------------------
+
+test("parseDoneChecklist parses file-exists item", () => {
+  const md = `## Done Checklist\n- file-exists: src/app.ts\n`;
+  const { items, unsupportedLines } = parseDoneChecklist(md);
+  assert.equal(items.length, 1);
+  assert.deepEqual(items[0], { kind: "file-exists", path: "src/app.ts" });
+  assert.equal(unsupportedLines.length, 0);
+});
+
+test("parseDoneChecklist parses symbol-exists item", () => {
+  const md = `## Done Checklist\n- symbol-exists: createApp in src/app.ts\n`;
+  const { items } = parseDoneChecklist(md);
+  assert.equal(items.length, 1);
+  assert.deepEqual(items[0], { kind: "symbol-exists", symbol: "createApp", path: "src/app.ts" });
+});
+
+test("parseDoneChecklist parses command-exits-0 item", () => {
+  const md = `## Done Checklist\n- command-exits-0: npm run build\n`;
+  const { items } = parseDoneChecklist(md);
+  assert.equal(items.length, 1);
+  assert.deepEqual(items[0], { kind: "command-exits-0", command: "npm run build" });
+});
+
+test("parseDoneChecklist parses test-passes item", () => {
+  const md = `## Done Checklist\n- test-passes: npm test -- --grep health\n`;
+  const { items } = parseDoneChecklist(md);
+  assert.equal(items.length, 1);
+  assert.deepEqual(items[0], { kind: "test-passes", description: "npm test -- --grep health" });
+});
+
+test("parseDoneChecklist parses multiple items", () => {
+  const md = [
+    "## Done Checklist",
+    "- file-exists: src/server.ts",
+    "- command-exits-0: npm run build",
+    "- test-passes: npm test",
+  ].join("\n");
+  const { items } = parseDoneChecklist(md);
+  assert.equal(items.length, 3);
+  assert.equal(items[0]?.kind, "file-exists");
+  assert.equal(items[1]?.kind, "command-exits-0");
+  assert.equal(items[2]?.kind, "test-passes");
+});
+
+test("parseDoneChecklist collects unsupported item kinds", () => {
+  const md = `## Done Checklist\n- unknown-kind: something\n`;
+  const { items, unsupportedLines } = parseDoneChecklist(md);
+  assert.equal(items.length, 0);
+  assert.equal(unsupportedLines.length, 1);
+  assert.ok(unsupportedLines[0]?.includes("unknown-kind"));
+});
+
+test("parseDoneChecklist returns empty when section absent", () => {
+  const { items, unsupportedLines } = parseDoneChecklist("# Task\n\nSome prose.\n");
+  assert.equal(items.length, 0);
+  assert.equal(unsupportedLines.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// parseBlockedCriteria
+// ---------------------------------------------------------------------------
+
+test("parseBlockedCriteria extracts blocked criteria from pipe table", () => {
+  const md = [
+    "| # | Criterion | Test file | Action | Notes |",
+    "|---|-----------|-----------|--------|-------|",
+    "| 1 | GET /health returns 200 | tests/health.test.ts | write | |",
+    "| 2 | Git commit exists | — | blocked | process criterion |",
+    "| 3 | Server starts in < 5s | — | blocked | load test required |",
+  ].join("\n");
+  const blocked = parseBlockedCriteria(md);
+  assert.equal(blocked.length, 2);
+  assert.ok(blocked.includes("Git commit exists"));
+  assert.ok(blocked.includes("Server starts in < 5s"));
+});
+
+test("parseBlockedCriteria returns empty for table with no blocked rows", () => {
+  const md = [
+    "| # | Criterion | Test file | Action | Notes |",
+    "|---|-----------|-----------|--------|-------|",
+    "| 1 | GET /health returns 200 | tests/health.test.ts | write | |",
+  ].join("\n");
+  assert.deepEqual(parseBlockedCriteria(md), []);
+});
+
+test("parseBlockedCriteria returns empty for malformed / empty input", () => {
+  assert.deepEqual(parseBlockedCriteria(""), []);
+  assert.deepEqual(parseBlockedCriteria("No table here."), []);
 });

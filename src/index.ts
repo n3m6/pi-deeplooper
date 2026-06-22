@@ -26,6 +26,7 @@ import { RecordingGateManager } from "./infra/replay/recording-gate.js";
 import { JsonlTelemetrySink } from "./infra/telemetry/jsonl-telemetry-sink.js";
 import { TimestampIdGenerator } from "./infra/system/id-generator.js";
 import { SystemClock } from "./infra/system/clock.js";
+import { PiCommandRunner } from "./infra/system/command-runner.js";
 import { Run } from "./domain/run/index.js";
 import { runPipeline } from "./application/pipeline/run-pipeline.js";
 import type { Dispatcher, GateManager, ModelPolicy, PipelineServices, RunState } from "./application/port/index.js";
@@ -118,6 +119,7 @@ export default function (pi: ExtensionAPI): void {
         artifactRepo: FileSystemArtifactRepository.fromPaths(artifacts),
         versionControl: new GitVersionControl(pi, ctx.cwd, runId),
         buildTool: new NpmBuildTool(pi),
+        commandRunner: new PiCommandRunner(pi),
         telemetrySink,
         stateRepo: new FileSystemRunStateRepository(artifacts.stateFile),
       };

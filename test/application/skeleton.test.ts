@@ -73,6 +73,9 @@ function makeMockVersionControl(workspaceRoot: string): VersionControl {
       return [];
     },
     async cleanupWorktree() {},
+    async stage7RegressionReusable() {
+      return { reusable: false, reason: "test-stub" };
+    },
   };
 }
 

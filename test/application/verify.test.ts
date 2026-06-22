@@ -56,7 +56,7 @@ async function writeCoreArtifacts(harness: TestHarness): Promise<void> {
   await writeFile(harness.artifacts.baselineResultsFile, "### Baseline Status — PASS\n\nAll checks passed.", "utf8");
   await writeFile(
     harness.artifacts.sliceQueueFile,
-    "# Slice Queue\n\n## S-01: Example slice\nstatus: done\ndeps: none\nrequeue_count: 0\nphase_dir: phases/phase-01\nsource: design\nacceptance_criteria:\n  - Example passes\n",
+    "# Slice Queue\n\n## S-01: Example slice\nstatus: done\ndeps: none\nrequeue_count: 0\nphase_dir: phases/phase-01\nsource: design\nacceptance_criteria:\n  - Example passes\n  - AC-2 returns 200\n",
     "utf8",
   );
 
@@ -137,14 +137,15 @@ test("verify stage adds remediation slices and routes back to slice-loop when re
         return textResult("### Overall Status — FAIL\n\n### Failures\n- AC-2 not met.");
       }
       if (request.target.name === "dl-reflector") {
+        // Use "Example passes" which IS in the queue — S-01 will be reopened.
         return textResult(
           [
             "### Status — PASS",
             "### Summary — Remediation planned.",
             "",
-            "### R-001: Remediate AC-2",
+            "### R-001: Remediate Example",
             "acceptance_criteria:",
-            "  - AC-2 returns 200",
+            "  - Example passes",
             "",
             "### Lessons",
             "- 2026-06-01 global (stage9-summary.md): re-check AC-2 wiring.",
@@ -180,10 +181,10 @@ test("verify stage adds remediation slices and routes back to slice-loop when re
   assert.equal(result.status, "FAIL");
   assert.equal(result.telemetry?.remediationSlicesAdded, true);
 
-  // The R-001 remediation slice must be appended to the queue as a ready slice.
+  // "Example passes" is in S-01, so S-01 should be reopened (not a new R-001 added).
   const queueMd = await readFile(harness.artifacts.sliceQueueFile, "utf8");
-  assert.match(queueMd, /## R-001: Remediate AC-2/);
-  assert.match(queueMd, /source: remediation/);
+  assert.match(queueMd, /status: ready/);
+  assert.match(queueMd, /last_reason: Reopened/);
 
   // The reflector's lessons must be persisted by the controller (read-only leaf).
   const lessons = await readFile(harness.artifacts.lessonsFile, "utf8");
@@ -245,4 +246,115 @@ test("verify stage returns PARTIAL with verify_status PARTIAL when verifier repo
 
   assert.equal(result.status, "PARTIAL");
   assert.equal(result.telemetry?.verify_status, "PARTIAL");
+});
+
+// ---------------------------------------------------------------------------
+// Issue 3a: verifier prompt includes STAGE7 REGRESSION REUSE directive
+// ---------------------------------------------------------------------------
+
+test("verify stage includes STAGE7 REGRESSION REUSE and CONFIGURED SCRIPTS in verifier prompt", async () => {
+  const harness = await TestHarness.create({ route: "full" });
+  harnesses.push(harness);
+  await writeCoreArtifacts(harness);
+
+  let capturedPrompt = "";
+  const dispatcher: Dispatcher = {
+    async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+      if (request.target.name === "dl-verifier") {
+        capturedPrompt = request.prompt;
+        return textResult("### Overall Status — PASS\n\n### Stage Summary\nAll good.");
+      }
+      return textResult("### Status — PASS\n\n### Summary\nPass.");
+    },
+    async dispatchParallel(requests) {
+      return Promise.all(requests.map((r) => this.dispatch(r)));
+    },
+    async dispatchChain(requests) {
+      const results: DispatchResult[] = [];
+      for (const r of requests) results.push(await this.dispatch(r));
+      return results;
+    },
+    async dispatchGenericCoding(_prompt) {
+      return { status: "PASS" as const, filesWritten: [], summary: "" };
+    },
+  };
+
+  await verifyStage.run({
+    ...harness.runtime(),
+    services: { ...harness.services, dispatcher },
+  });
+
+  assert.ok(
+    capturedPrompt.includes("=== STAGE7 REGRESSION REUSE ==="),
+    "verifier prompt must contain STAGE7 REGRESSION REUSE block",
+  );
+  assert.ok(capturedPrompt.includes("reusable:"), "verifier prompt STAGE7 block must include 'reusable:' key");
+  assert.ok(
+    capturedPrompt.includes("=== CONFIGURED SCRIPTS ==="),
+    "verifier prompt must contain CONFIGURED SCRIPTS block",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Issue 3b: remediation criteria not in queue are dropped with anomaly
+// ---------------------------------------------------------------------------
+
+test("verify stage drops remediation criteria not in queue and records anomaly", async () => {
+  const harness = await TestHarness.create({ route: "full" });
+  harnesses.push(harness);
+  await writeCoreArtifacts(harness);
+
+  // Verifier FAILs; reflector returns R-001 with a process criterion that doesn't trace to the queue.
+  const dispatcher: Dispatcher = {
+    async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+      if (request.target.name === "dl-verifier") {
+        return textResult("### Overall Status — FAIL\n\n### Failures\n- Something wrong.");
+      }
+      if (request.target.name === "dl-reflector") {
+        return textResult(
+          [
+            "### Status — PASS",
+            "### Summary — Remediation proposed.",
+            "",
+            "### R-001: Fix process criterion",
+            "acceptance_criteria:",
+            "  - git commit exists",
+            "",
+            "### Lessons",
+            "None.",
+          ].join("\n"),
+        );
+      }
+      return textResult("### Status — PASS\n\n### Summary\nPass.");
+    },
+    async dispatchParallel(requests) {
+      return Promise.all(requests.map((r) => this.dispatch(r)));
+    },
+    async dispatchChain(requests) {
+      const results: DispatchResult[] = [];
+      for (const r of requests) results.push(await this.dispatch(r));
+      return results;
+    },
+    async dispatchGenericCoding(_prompt) {
+      return { status: "PASS" as const, filesWritten: [], summary: "" };
+    },
+  };
+
+  const result = await verifyStage.run({
+    ...harness.runtime(),
+    services: { ...harness.services, dispatcher },
+  });
+
+  // "git commit exists" is NOT in the slice queue, so it should be dropped.
+  // No remediation slices → escalate LOOP_DESIGN.
+  assert.equal(result.status, "FAIL");
+  assert.ok(!result.telemetry?.remediationSlicesAdded, "No remediation slices should be added for process criteria");
+
+  // Anomaly should have been recorded.
+  const events = await harness.telemetrySink.readEvents();
+  const filteredAnomalies = events.filter(
+    (e: import("../../src/application/port/index.js").TelemetryEvent) =>
+      e.event_type === "pipeline.anomaly" && e.context?.["code"] === "remediation-criteria-filtered",
+  );
+  assert.ok(filteredAnomalies.length > 0, "Expected remediation-criteria-filtered anomaly to be recorded");
 });

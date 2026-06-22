@@ -479,3 +479,57 @@ test("interactive fail-closed returns FAIL when interviewer does not call interv
     assert.match(outcome.summary, /interview_return/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue 2: reviewer receives accumulated prior findings (convergence)
+// ---------------------------------------------------------------------------
+
+test("goals review dispatches prior findings to reviewer on round 2+", async () => {
+  await withWorkspace(async ({ runtime }) => {
+    const receivedPrompts: string[] = [];
+
+    // A dispatcher that records every reviewer prompt, fails once, then passes.
+    const dispatcher: import("../../src/application/port/index.js").Dispatcher = {
+      async dispatch(request) {
+        if (request.target.kind !== "leaf") return textResult("");
+        const name = request.target.name;
+        if (name === "dl-goals-synthesizer" || name === "dl-goals-interviewer") {
+          return invokeGoalsReturn(request, "full");
+        }
+        if (name === "dl-goals-reviewer") {
+          receivedPrompts.push(request.prompt);
+          // Fail on round 1, pass on round 2+.
+          if (receivedPrompts.length === 1) {
+            return textResult(
+              "### Status — FAIL\n\n### Fix Guidance\n1. Add a non-goal section.\n\n### Summary\nMissing non-goals.",
+            );
+          }
+          return textResult("### Status — PASS\n\n### Summary\nAll issues resolved.");
+        }
+        return textResult("");
+      },
+      async dispatchParallel(requests) {
+        return Promise.all(requests.map((r) => this.dispatch(r)));
+      },
+      async dispatchChain(requests) {
+        const results: import("../../src/application/port/index.js").DispatchResult[] = [];
+        for (const r of requests) results.push(await this.dispatch(r));
+        return results;
+      },
+      async dispatchGenericCoding() {
+        return { status: "FAIL" as const, filesWritten: [], summary: "not used" };
+      },
+    };
+
+    await goalsStage.run({ ...runtime, services: { ...runtime.services, dispatcher } });
+
+    // Round 2 prompt must include PRIOR REVIEW FINDINGS from round 1.
+    assert.ok(receivedPrompts.length >= 2, "reviewer should be called at least twice");
+    const round2Prompt = receivedPrompts[1] ?? "";
+    assert.ok(
+      round2Prompt.includes("=== PRIOR REVIEW FINDINGS ==="),
+      "round 2 reviewer prompt must include prior findings block",
+    );
+    assert.ok(round2Prompt.includes("Review Round 1"), "round 2 reviewer prompt must include prior round label");
+  });
+});

@@ -69,4 +69,8 @@ export class StubChangesVersionControl implements VersionControl {
   cleanupWorktree(worktree: TaskWorktreeHandle, signal?: AbortSignal): Promise<void> {
     return this.inner.cleanupWorktree(worktree, signal);
   }
+
+  stage7RegressionReusable(signal?: AbortSignal): Promise<{ reusable: boolean; reason: string }> {
+    return this.inner.stage7RegressionReusable(signal);
+  }
 }

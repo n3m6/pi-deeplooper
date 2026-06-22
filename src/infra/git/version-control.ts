@@ -393,6 +393,50 @@ export class GitVersionControl implements VersionControl {
     await mgr.cleanup(worktree, signal);
   }
 
+  async stage7RegressionReusable(signal?: AbortSignal): Promise<{ reusable: boolean; reason: string }> {
+    const opts = { cwd: this.workspaceRoot, timeout: 30_000, ...(signal ? { signal } : {}) };
+
+    // Find the last squash-merge commit produced by implement.ts.
+    // Pattern: "deeplooper: phase <N> task …"
+    const hashResult = await this.pi.exec("git", ["log", "-1", "--format=%H", "--grep=^deeplooper: phase"], opts);
+
+    if (hashResult.code !== 0 || !hashResult.stdout.trim()) {
+      return { reusable: false, reason: "no-phase-commit: no deeplooper phase commit found; running full suite" };
+    }
+
+    const hash = hashResult.stdout.trim();
+
+    // Check whether any production source changed between that commit and HEAD,
+    // excluding test files and pipeline scratch.
+    const diffResult = await this.pi.exec(
+      "git",
+      [
+        "log",
+        "--oneline",
+        `${hash}..HEAD`,
+        "--",
+        ".",
+        ":(exclude)*.test.*",
+        ":(exclude)*.spec.*",
+        ":(exclude)**/test/**",
+        ":(exclude)**/tests/**",
+        ":(exclude)**/__tests__/**",
+        ":(exclude).pipeline/**",
+      ],
+      opts,
+    );
+
+    if (diffResult.code !== 0) {
+      return { reusable: false, reason: "diff-error: could not determine production changes; running full suite" };
+    }
+
+    if (diffResult.stdout.trim()) {
+      return { reusable: false, reason: "production-changes: production source changed since Stage-7 commit" };
+    }
+
+    return { reusable: true, reason: `reuse-ok: no production changes since ${hash.slice(0, 8)}` };
+  }
+
   private buildWorktreeManager(repoRoot: string): WorktreeManager {
     return new WorktreeManager(this.pi, this.workspaceRoot, repoRoot, this.runId);
   }

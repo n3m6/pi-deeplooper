@@ -275,6 +275,12 @@ export class CassetteReader {
     return bucket.shift();
   }
 
+  /** Returns true when a cassette entry exists for the given key without consuming it. */
+  peekDispatch(key: string): boolean {
+    const bucket = this.dispatchBuckets.get(key);
+    return bucket !== undefined && bucket.length > 0;
+  }
+
   nextGate(method: GateMethod): GateCassetteEntry | undefined {
     const queue = this.gateQueues.get(method);
     if (!queue || queue.length === 0) return undefined;

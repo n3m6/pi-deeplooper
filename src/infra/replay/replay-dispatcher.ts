@@ -99,6 +99,28 @@ export class ReplayDispatcher implements Dispatcher {
       activityLabel?: string;
     },
   ): Promise<StageOutcome> {
+    // Check whether the cassette has an entry for this generic dispatch before dispatching.
+    // If not, and we have a live-fallthrough dispatcher, call its dispatchGenericCoding directly
+    // (so it doesn't go through the generic dispatch path which PostCassetteAgentFallback rejects).
+    const key = dispatchKey(
+      {
+        target: {
+          kind: "generic",
+          name: "generic-coding",
+          tools: options?.tools ?? ["read", "bash", "edit", "write", "grep", "find", "ls"],
+          thinkingLevel: "high",
+        },
+        prompt,
+        cwd: options?.cwd ?? "",
+        customTools: [],
+      },
+      this.workspaceRoot,
+      this.runId,
+    );
+    if (!this.reader.peekDispatch(key) && this.missPolicy === "live-fallthrough" && this.fallthrough) {
+      return this.fallthrough.dispatchGenericCoding(prompt, options);
+    }
+
     const stageReturns: StageReturnPayload[] = [];
     const result = await this.dispatch({
       target: {

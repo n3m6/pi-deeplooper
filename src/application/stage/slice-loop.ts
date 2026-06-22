@@ -21,8 +21,15 @@
 
 import { SliceQueue } from "../../domain/slice/slice-queue.js";
 import { Run, MAX_REQUEUE } from "../../domain/run/index.js";
-import { designDeclaresSlices, parseMarkdownSections, parseReviewStatus } from "../../infra/codec/markdown-codec.js";
-import type { BackwardLoopRequest, StageModule, StageOutcome, StageRuntime } from "../port/index.js";
+import {
+  designDeclaresSlices,
+  isEmptySectionValue,
+  normalizeAgentSection,
+  parseMarkdownSections,
+  parseDoneChecklist,
+  parseReviewStatus,
+} from "../../infra/codec/markdown-codec.js";
+import type { BackwardLoopRequest, CommandRunnerPort, StageModule, StageOutcome, StageRuntime } from "../port/index.js";
 import { runSliceImplementation } from "./implement.js";
 import { appendReflectorSection, dispatchLeaf, recordAnomaly, safeReadArtifact, writeArtifact } from "./utils.js";
 
@@ -545,9 +552,32 @@ async function runSliceReflect(
   await appendReflectorSection(runtime, { kind: "specHistory" }, sections["Spec History"]);
 
   // Reflector may amend goals.md in place (full replacement; clarifications only).
-  const goalsAmendment = sections["Goals Amendment"]?.trim();
-  if (goalsAmendment && goalsAmendment !== "None.") {
-    await writeArtifact(runtime, { kind: "goals" }, goalsAmendment);
+  // Guard: normalize the section (strip stray fences, trim) and treat it as empty
+  // when it matches /^none\.?$/i or is blank — protects against the "None.\n```"
+  // stray-fence corruption that wiped goals.md in the pi-test run.
+  const rawAmendment = sections["Goals Amendment"] ?? "";
+  const normalizedAmendment = normalizeAgentSection(rawAmendment);
+  if (!isEmptySectionValue(normalizedAmendment)) {
+    // Non-degenerate guard: reject replacements that look structurally wrong.
+    // A valid goals amendment must contain at least one FR or AC marker, and
+    // must not be drastically shorter than the existing spec (< 50% length).
+    const currentGoals = goals ?? "";
+    const hasFrOrAcMarker = /\bFR\b|\bAC\b|acceptance.criter|functional.req/i.test(normalizedAmendment);
+    const notTooShort = currentGoals.length === 0 || normalizedAmendment.length >= currentGoals.length * 0.5;
+    if (hasFrOrAcMarker && notTooShort) {
+      await writeArtifact(runtime, { kind: "goals" }, normalizedAmendment);
+    } else {
+      await recordAnomaly(
+        runtime,
+        "goals-amendment-rejected",
+        "warning",
+        `dl-reflector returned a Goals Amendment for slice ${sliceId} that failed the non-degenerate guard ` +
+          `(hasFrOrAcMarker=${String(hasFrOrAcMarker)}, notTooShort=${String(notTooShort)}, ` +
+          `amendmentLength=${normalizedAmendment.length}, currentLength=${currentGoals.length}). ` +
+          `The amendment was discarded to protect goals.md integrity.`,
+        { sliceId, amendmentLength: normalizedAmendment.length, currentLength: currentGoals.length },
+      );
+    }
   }
 }
 
@@ -694,7 +724,105 @@ async function assertSliceProducedEvidence(
     }
   }
 
+  // --- Done-checklist re-execution: deterministically verify each item ---
+  // The done-checker is treated as advisory; the controller is the source of truth.
+  // Parse all task specs for this phase and re-run each checklist item.
+  const commandRunner = runtime.services.commandRunner;
+  const taskSpecIds = await repo.listTaskSpecs(phase);
+  const taskSpecTexts = (await Promise.all(taskSpecIds.map((id) => repo.read(id)))).filter(
+    (t): t is string => t !== undefined,
+  );
+
+  for (const taskSpecText of taskSpecTexts) {
+    const { items, unsupportedLines } = parseDoneChecklist(taskSpecText);
+
+    for (const line of unsupportedLines) {
+      await recordAnomaly(
+        runtime,
+        "done-checklist-unsupported-item",
+        "warning",
+        `Slice ${sliceId} done-checklist contains unsupported item type: "${line}"`,
+        { sliceId, phase, line },
+      );
+    }
+
+    for (const item of items) {
+      const checkResult = await executeDoneChecklistItem(item, runtime.workspaceRoot, commandRunner);
+      if (!checkResult.ok) {
+        await recordAnomaly(
+          runtime,
+          "done-checklist-item-failed",
+          "error",
+          `Slice ${sliceId} done-checklist item failed deterministic re-check: ${checkResult.reason}`,
+          { sliceId, phase, item, reason: checkResult.reason },
+        );
+        return {
+          status: "FAIL",
+          reason: `Slice ${sliceId} evidence gate: done-checklist item failed: ${checkResult.reason}`,
+        };
+      }
+    }
+  }
+
   void signal; // signal intentionally unused here — build scripts are short
 
   return { status: "PASS", reason: "" };
+}
+
+/**
+ * Deterministically execute a single done-checklist item.
+ * Returns { ok: true } when the item passes, or { ok: false, reason } when it fails.
+ */
+async function executeDoneChecklistItem(
+  item: ReturnType<typeof parseDoneChecklist>["items"][number],
+  workspaceRoot: string,
+  commandRunner: CommandRunnerPort,
+): Promise<{ ok: boolean; reason: string }> {
+  switch (item.kind) {
+    case "file-exists": {
+      // Use the command runner to check file existence (avoids node:fs in the application layer).
+      const absPath = item.path.startsWith("/") ? item.path : `${workspaceRoot}/${item.path}`;
+      const result = await commandRunner.run("test", ["-f", absPath], workspaceRoot, { timeoutMs: 5_000 });
+      if (result.code === 0) return { ok: true, reason: "" };
+      return { ok: false, reason: `file-exists check failed: ${item.path} does not exist` };
+    }
+
+    case "symbol-exists": {
+      // Use grep to search for the symbol in the given file.
+      const absPath = item.path.startsWith("/") ? item.path : `${workspaceRoot}/${item.path}`;
+      const result = await commandRunner.run("grep", ["-q", item.symbol, absPath], workspaceRoot, {
+        timeoutMs: 10_000,
+      });
+      if (result.code === 0) return { ok: true, reason: "" };
+      return { ok: false, reason: `symbol-exists check failed: symbol "${item.symbol}" not found in ${item.path}` };
+    }
+
+    case "command-exits-0": {
+      // Split on whitespace for args, treating the first token as the command.
+      const tokens = item.command.split(/\s+/).filter(Boolean);
+      const cmd = tokens[0];
+      if (!cmd) return { ok: false, reason: `command-exits-0: empty command string` };
+      const args = tokens.slice(1);
+      const result = await commandRunner.run(cmd, args, workspaceRoot, { timeoutMs: 60_000 });
+      if (result.code === 0) return { ok: true, reason: "" };
+      return {
+        ok: false,
+        reason: `command-exits-0 check failed: "${item.command}" exited ${result.code}. ${result.stderr.slice(0, 200)}`,
+      };
+    }
+
+    case "test-passes": {
+      // Run the test description as a command via shell so it supports npm test patterns.
+      const tokens = item.description.split(/\s+/).filter(Boolean);
+      const cmd = tokens[0];
+      if (!cmd) return { ok: false, reason: `test-passes: empty description` };
+      const args = tokens.slice(1);
+      const result = await commandRunner.run(cmd, args, workspaceRoot, { timeoutMs: 120_000 });
+      if (result.code === 0) return { ok: true, reason: "" };
+      return {
+        ok: false,
+        reason: `test-passes check failed: "${item.description}" exited ${result.code}. ${result.stderr.slice(0, 200)}`,
+      };
+    }
+  }
 }

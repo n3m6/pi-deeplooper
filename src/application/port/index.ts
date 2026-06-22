@@ -398,6 +398,7 @@ export interface PipelineServices {
   /** Port-based infrastructure — wired by the composition root. */
   versionControl: VersionControl;
   buildTool: BuildToolPort;
+  commandRunner: CommandRunnerPort;
   artifactRepo: ArtifactRepository;
   telemetrySink: TelemetrySink;
   stateRepo: RunStateRepository;
@@ -501,6 +502,15 @@ export interface VersionControl {
   changedLineCount(cwd: string, signal?: AbortSignal): Promise<number>;
   listWorkspaceFiles(cwd: string, signal?: AbortSignal): Promise<string[]>;
   cleanupWorktree(worktree: TaskWorktreeHandle, signal?: AbortSignal): Promise<void>;
+  /**
+   * Determine whether Stage-7 regression results can be reused in Stage-9.
+   *
+   * Reuse is allowed when a `deeplooper: phase` squash-merge commit exists AND
+   * no production source file changed between that commit and HEAD.  When no
+   * such commit exists (e.g. a git-only remediation slice produced no code commit)
+   * we simply return reusable:false (full re-run) — never an error.
+   */
+  stage7RegressionReusable(signal?: AbortSignal): Promise<{ reusable: boolean; reason: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +526,15 @@ export interface ExecOutcome {
 export interface BuildToolPort {
   availableScripts(cwd: string): Promise<string[]>;
   runScript(name: string, cwd: string): Promise<ExecOutcome>;
+}
+
+// ---------------------------------------------------------------------------
+// CommandRunnerPort — run arbitrary shell commands deterministically
+// ---------------------------------------------------------------------------
+
+export interface CommandRunnerPort {
+  /** Run an arbitrary command. Split the command string into tokens for args. */
+  run(command: string, args: string[], cwd: string, opts?: { timeoutMs?: number }): Promise<ExecOutcome>;
 }
 
 // ---------------------------------------------------------------------------

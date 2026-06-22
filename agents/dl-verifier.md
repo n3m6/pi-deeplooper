@@ -36,26 +36,32 @@ You are the DEEPLOOPER Verifier. Run the final verification pass: full configure
 - `=== PHASE REGRESSION RESULTS ===` — per-phase `regression-results.md` when present (or `## Phase N — None.`)
 - `=== ACCEPTANCE RESULTS (ALL PHASES) ===` — all phase acceptance results (with the `Failure Reason` column)
 - `=== BASELINE RESULTS ===` — baseline-results.md (may include a `Coverage` row)
+- `=== STAGE7 REGRESSION REUSE ===` — controller-computed reuse decision (`reusable: true/false`, `reason: …`)
+- `=== CONFIGURED SCRIPTS ===` — authoritative list of npm scripts available in the project (comma-separated)
 
 ### Verification Pass
 
 **Step 0 — Decide whether to reuse Stage 7's incremental regression results**
 
-Inspect `=== PHASE REGRESSION RESULTS ===` for the most recent phase. The latest phase's `regression-results.md` is the only candidate; earlier phases are superseded by later ones because the baseline keeps moving forward.
+The controller has already determined the reuse eligibility and placed the result in `=== STAGE7 REGRESSION REUSE ===`. **Do not run git commands or probe git history yourself.** Rely solely on this directive.
 
-Reuse is allowed when **all** of the following hold:
+- `reusable: true` → reuse is allowed. Apply the conditions below.
+- `reusable: false` → skip to Step 1's full suite (reason is provided for logging only).
 
-1. The latest phase's `regression-results.md` reports `### Status — PASS` and `### Skipped Checks` is `None.` (i.e. no incremental skips were taken). If skips were taken, the cached pass is partial and full re-run is required.
-2. No production source change has occurred since the Stage 7 commit. Determine via `bash`: locate the last `deeplooper: phase [N] *` checkpoint hash with `git log -1 --format='%H' --grep='^deeplooper: phase'`, then run `git log --oneline <hash>..HEAD -- ':!*.test.*' ':!*.spec.*' ':!**/test/**' ':!**/tests/**' ':!**/__tests__/**'`. Reuse only when the output is empty (no production changes since Stage 7).
-3. The baseline `Coverage` row, if present, is also `PASS` in the cached `regression-results.md`.
+When reuse is allowed, also verify these conditions against the artifact data:
 
-When reuse is allowed:
+1. The latest phase's `regression-results.md` reports `### Status — PASS` and `### Skipped Checks` is `None.` (i.e. no incremental skips were taken). If skips were taken, do a full re-run even if the directive says reusable.
+2. The baseline `Coverage` row, if present, is also `PASS` in the cached `regression-results.md`.
+
+When reuse is allowed and artifact conditions hold:
 
 - Set `### Build`, `### Lint`, `### Typecheck`, and `### Test` from the cached row in `regression-results.md` (annotate `Details` with `Verified at Stage 7 (PASS, no production changes since)`).
 - Run **only** the acceptance test full re-run plus a smoke sub-suite of `### E2E` via `@build` to catch any environment regressions in this fresh process.
 - Skip Step 1 below; jump directly to Step 2 with the reused values.
 
-When reuse is not allowed (or `=== PHASE REGRESSION RESULTS ===` is `None.`), proceed with Step 1's full suite.
+When reuse is not allowed (directive says `reusable: false` or artifact conditions fail), proceed with Step 1's full suite.
+
+**Script availability note:** use `=== CONFIGURED SCRIPTS ===` to determine which scripts are available before invoking them. Do not probe the project's `package.json` yourself. If a script is not listed there, mark its check as `NOT CONFIGURED` rather than running it.
 
 **Step 1 — Run checks**
 

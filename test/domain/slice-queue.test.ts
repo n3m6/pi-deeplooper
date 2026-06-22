@@ -420,6 +420,62 @@ acceptance_criteria:
   assert.ok(queue.getById("R-001"), "R-001 should be added");
 });
 
+test("applyRemediationFromMarkdown with allowCriterion filters unknown criteria", () => {
+  const q = SliceQueue.parse(DONE_QUEUE_MD);
+  const block = `### R-001: Git bookkeeping
+acceptance_criteria:
+  - git commit exists
+  - GET /health returns 200
+`;
+  // Only allow criteria already in the queue (S1 owns "GET /health returns 200").
+  const knownCriteria = new Set(q.allAcceptanceCriteria());
+  const allowCriterion = (ac: string) => knownCriteria.has(ac.trim());
+  const { queue, reopened, added, dropped } = q.applyRemediationFromMarkdown(block, allowCriterion);
+  // "git commit exists" is NOT a known AC, so it should be dropped.
+  assert.ok(dropped.includes("git commit exists"), "process criterion should be dropped");
+  // "GET /health returns 200" IS a known AC (owned by S1), so S1 should be reopened.
+  assert.deepEqual(reopened, ["S1"], "S1 should be reopened for the known criterion");
+  assert.deepEqual(added, [], "no new R-NNN should be added");
+  assert.equal(queue.getById("R-001"), undefined);
+});
+
+test("applyRemediationFromMarkdown with allowCriterion drops slice if all criteria are filtered", () => {
+  const q = SliceQueue.parse(DONE_QUEUE_MD);
+  const block = `### R-001: All process criteria
+acceptance_criteria:
+  - git commit exists
+  - deeplooper checkpoint present
+`;
+  const allowCriterion = (_ac: string) => false; // drop everything
+  const { queue, added, dropped } = q.applyRemediationFromMarkdown(block, allowCriterion);
+  assert.equal(dropped.length, 2);
+  assert.deepEqual(added, []);
+  assert.equal(queue.getById("R-001"), undefined);
+});
+
+test("addRemediationSlices with allowCriterion filters criteria within new slices", () => {
+  const q = SliceQueue.empty();
+  const criteria = [{ id: "R-001", title: "Mixed", acceptanceCriteria: ["keep me", "drop me"] }];
+  const updated = q.addRemediationSlices(criteria, (ac) => ac === "keep me");
+  const r = updated.getById("R-001");
+  assert.ok(r, "R-001 should exist");
+  assert.deepEqual(r?.acceptanceCriteria, ["keep me"]);
+});
+
+test("addRemediationSlices with allowCriterion drops entire slice when all criteria filtered", () => {
+  const q = SliceQueue.empty();
+  const criteria = [{ id: "R-001", title: "All dropped", acceptanceCriteria: ["drop me"] }];
+  const updated = q.addRemediationSlices(criteria, () => false);
+  assert.equal(updated.getById("R-001"), undefined, "slice with 0 criteria should not be added");
+});
+
+test("allAcceptanceCriteria returns all unique criteria across slices", () => {
+  const q = SliceQueue.parse(DONE_QUEUE_MD);
+  const criteria = q.allAcceptanceCriteria();
+  assert.ok(criteria.includes("GET /health returns 200"), "should include known criterion");
+  assert.ok(criteria.length > 0);
+});
+
 // ---------------------------------------------------------------------------
 // Point 5: reconcile with failingCriteria
 // ---------------------------------------------------------------------------

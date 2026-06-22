@@ -22,6 +22,7 @@ import { FileSystemArtifactRepository } from "../../src/infra/fs/artifact-reposi
 import { FileSystemRunStateRepository } from "../../src/infra/fs/state-repository.js";
 import { GitVersionControl } from "../../src/infra/git/version-control.js";
 import { NpmBuildTool } from "../../src/infra/npm/build-tool.js";
+import { FakeCommandRunner } from "./fake-command-runner.js";
 import { JsonlTelemetrySink } from "../../src/infra/telemetry/jsonl-telemetry-sink.js";
 import type {
   DispatchRequest,
@@ -114,6 +115,7 @@ export class TestHarness {
     const progress = new NoopProgressReporter();
     const versionControl = new GitVersionControl(pi, workspaceRoot, runId);
     const buildTool = new NpmBuildTool(pi);
+    const commandRunner = new FakeCommandRunner();
     const artifactRepo = FileSystemArtifactRepository.fromPaths(artifacts);
     const stateRepo = new FileSystemRunStateRepository(artifacts.stateFile);
     const clock = new SystemClock();
@@ -130,6 +132,7 @@ export class TestHarness {
       clock,
       versionControl,
       buildTool,
+      commandRunner,
       artifactRepo,
       stateRepo,
       telemetrySink,

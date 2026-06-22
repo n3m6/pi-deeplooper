@@ -14,7 +14,14 @@
 import { SliceQueue } from "../../domain/slice/slice-queue.js";
 import { parseMarkdownSections } from "../../infra/codec/markdown-codec.js";
 import type { StageModule, StageOutcome, StageRuntime } from "../port/index.js";
-import { appendReflectorLessons, dispatchLeaf, readArtifact, safeReadArtifact, writeArtifact } from "./utils.js";
+import {
+  appendReflectorLessons,
+  dispatchLeaf,
+  readArtifact,
+  recordAnomaly,
+  safeReadArtifact,
+  writeArtifact,
+} from "./utils.js";
 
 export const verifyStage: StageModule = {
   stage: "verify",
@@ -31,6 +38,14 @@ export const verifyStage: StageModule = {
     const allDoneChecks = await readAllPhaseArtifacts(runtime, "done-check-results.md");
     const allExecManifests = await readAllPhaseArtifacts(runtime, "execution-manifest.md");
     const allRegressionResults = await readAllPhaseArtifacts(runtime, "regression-results.md");
+
+    // Controller decides whether cached Stage-7 regression results can be reused.
+    // This decouples the verifier from pipeline bookkeeping conventions — it no longer
+    // probes git history itself, which was the root cause of the spurious R-001 defect.
+    const reuseDecision = await runtime.services.versionControl.stage7RegressionReusable(
+      runtime.services.commandContext.signal,
+    );
+    const configuredScripts = await runtime.services.buildTool.availableScripts(runtime.workspaceRoot);
 
     const verification = await dispatchLeaf(
       runtime,
@@ -65,6 +80,13 @@ export const verifyStage: StageModule = {
         "",
         "=== LESSONS ===",
         lessons || "(none)",
+        "",
+        "=== STAGE7 REGRESSION REUSE ===",
+        `reusable: ${String(reuseDecision.reusable)}`,
+        `reason: ${reuseDecision.reason}`,
+        "",
+        "=== CONFIGURED SCRIPTS ===",
+        configuredScripts.length > 0 ? configuredScripts.join(", ") : "(none)",
       ].join("\n"),
     );
 
@@ -106,9 +128,30 @@ export const verifyStage: StageModule = {
     // the queue (pattern B). Remediation slices are returned as `### R-NNN: <title>`
     // sections; remediation is "added" (or an existing done slice is reopened) only when
     // the queue actually changes. Prefer reopening a falsely-done slice over adding R-NNN.
+    //
+    // Process/meta criteria (e.g. "git commit exists") are filtered out: only criteria
+    // that trace to a known acceptance criterion in the queue are allowed through.
     const reflectSections = parseMarkdownSections(reflect.text);
     const existingQueue = sliceQueueMd ? SliceQueue.parse(sliceQueueMd) : SliceQueue.empty();
-    const { queue: updatedQueue, reopened, added } = existingQueue.applyRemediationFromMarkdown(reflect.text);
+    const knownCriteria = new Set(existingQueue.allAcceptanceCriteria());
+    const allowCriterion = (ac: string) => knownCriteria.has(ac.trim()) || knownCriteria.has(ac);
+    const {
+      queue: updatedQueue,
+      reopened,
+      added,
+      dropped,
+    } = existingQueue.applyRemediationFromMarkdown(reflect.text, allowCriterion);
+    if (dropped.length > 0) {
+      await recordAnomaly(
+        runtime,
+        "remediation-criteria-filtered",
+        "warning",
+        `dl-reflector proposed ${String(dropped.length)} remediation criterion/criteria that do not trace to any ` +
+          `known acceptance criterion in the slice queue. They were dropped to prevent process/meta criteria ` +
+          `from entering the queue.`,
+        { dropped },
+      );
+    }
     const remediationSlicesAdded = reopened.length > 0 || added.length > 0;
 
     if (remediationSlicesAdded) {

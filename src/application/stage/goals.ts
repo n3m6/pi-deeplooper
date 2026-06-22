@@ -1,5 +1,6 @@
 import { QUESTION_SET, inferFromTask, unresolvedRequiredBranches } from "../../domain/goals/interview-policy.js";
 import { MAX_GOALS_REVIEW_ROUNDS, MAX_TRANSIENT_DISPATCH_RETRIES } from "../../domain/run/index.js";
+import { normalizeAgentSection } from "../../infra/codec/markdown-codec.js";
 import { runAgentReviewLoop } from "../workflow/agent-review-loop.js";
 import type { DispatchResult, GoalsReturnPayload, InterviewEntry } from "../port/index.js";
 import { readGoalsReturn, readInterviewReturn } from "../port/index.js";
@@ -97,33 +98,43 @@ export const goalsStage: StageModule = {
           telemetry: gateNoneTelemetry(0),
         };
       }
-      await writeArtifact(runtime, { kind: "goals" }, goalsReturn.goalsMarkdown);
+      await writeArtifact(runtime, { kind: "goals" }, normalizeAgentSection(goalsReturn.goalsMarkdown));
       await writeArtifact(runtime, { kind: "config" }, renderGoalsConfig(runtime.state.runId, goalsReturn));
 
       // 2. Run agent review loop
       const interviewRecord = renderInterviewRecord(interview.entries);
       const requirements = await readArtifact(runtime, { kind: "requirements" });
-      // Accumulates every reviewer finding so the synthesizer can satisfy all rounds simultaneously.
+      // Accumulates every reviewer finding so the synthesizer and reviewer can
+      // satisfy / track all rounds simultaneously (convergence requires memory).
       const reviewHistory: string[] = [];
       const review = await runAgentReviewLoop(runtime, {
         maxRounds: MAX_GOALS_REVIEW_ROUNDS,
         stageName: "goals",
-        runReview: async () => {
+        runReview: async (round) => {
           const goals = await readArtifact(runtime, { kind: "goals" });
-          const result = await dispatchLeaf(
-            runtime,
-            "dl-goals-reviewer",
-            [
-              "=== REQUIREMENTS ===",
-              requirements,
-              "",
-              "=== INTERVIEW RECORD ===",
-              interviewRecord,
-              "",
-              "=== GOALS ===",
-              goals,
-            ].join("\n"),
-          );
+          // Include all prior rounds' findings so the reviewer can confirm they
+          // are resolved rather than re-raising them as fresh nitpicks.
+          const priorFindingsBlock =
+            reviewHistory.length > 0
+              ? [
+                  "",
+                  "=== PRIOR REVIEW FINDINGS ===",
+                  reviewHistory.map((text, i) => `## Review Round ${i + 1}\n${text}`).join("\n\n"),
+                ].join("\n")
+              : "";
+          void round; // round counter available for future use
+          const promptParts = [
+            "=== REQUIREMENTS ===",
+            requirements,
+            "",
+            "=== INTERVIEW RECORD ===",
+            interviewRecord,
+            "",
+            "=== GOALS ===",
+            goals,
+          ];
+          if (priorFindingsBlock) promptParts.push(priorFindingsBlock);
+          const result = await dispatchLeaf(runtime, "dl-goals-reviewer", promptParts.join("\n"));
           const failure = dispatchFailureSummary(result, "Goals review failed");
           if (failure) return { failure, transient: isTransientDispatchFailure(result) };
           return { text: result.text };
@@ -159,7 +170,7 @@ export const goalsStage: StageModule = {
           if (rewriteFailure) return { failure: rewriteFailure, transient: isTransientDispatchFailure(rewritten) };
           const rewriteReturn = readGoalsReturn(rewritten);
           if (!rewriteReturn) return { failure: "Goals rewrite did not call goals_return." };
-          await writeArtifact(runtime, { kind: "goals" }, rewriteReturn.goalsMarkdown);
+          await writeArtifact(runtime, { kind: "goals" }, normalizeAgentSection(rewriteReturn.goalsMarkdown));
           await writeArtifact(runtime, { kind: "config" }, renderGoalsConfig(runtime.state.runId, rewriteReturn));
         },
       });

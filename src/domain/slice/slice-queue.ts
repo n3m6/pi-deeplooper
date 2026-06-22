@@ -200,6 +200,20 @@ export class SliceQueue {
   }
 
   /**
+   * Return all distinct acceptance criteria across every slice in the queue
+   * (all statuses). Useful for building filter predicates.
+   */
+  allAcceptanceCriteria(): string[] {
+    const seen = new Set<string>();
+    for (const slice of this._slices) {
+      for (const ac of slice.acceptanceCriteria) {
+        seen.add(ac.trim());
+      }
+    }
+    return [...seen];
+  }
+
+  /**
    * Find an existing done or escalated slice that "owns" a given acceptance criterion
    * (i.e., the criterion appears verbatim in the slice's acceptanceCriteria array).
    * Returns undefined when no existing slice owns the criterion.
@@ -217,14 +231,19 @@ export class SliceQueue {
    * existing done/escalated slice owns all of its acceptance criteria, reopen that slice
    * instead of appending a new R-NNN. Only append genuinely new R-NNN slices.
    *
-   * Returns `{ queue, reopened, added }` so callers can record telemetry.
+   * Returns `{ queue, reopened, added, dropped }` so callers can record telemetry.
+   * Criteria that are dropped by `allowCriterion` are listed in `dropped`.
    */
-  applyRemediationWithReopen(proposedEntries: Array<{ id: string; title: string; acceptanceCriteria: string[] }>): {
+  applyRemediationWithReopen(
+    proposedEntries: Array<{ id: string; title: string; acceptanceCriteria: string[] }>,
+    allowCriterion?: (ac: string) => boolean,
+  ): {
     queue: SliceQueue;
     reopened: string[];
     added: string[];
+    dropped: string[];
   } {
-    return applyRemediationWithReopenHelper(this, proposedEntries);
+    return applyRemediationWithReopenHelper(this, proposedEntries, allowCriterion);
   }
 
   /**
@@ -232,8 +251,15 @@ export class SliceQueue {
    * Remediation slices get IDs in the form R-NNN, are source="remediation",
    * have no deps (they can run independently), and their phaseDir is computed
    * from the next available phase number.
+   *
+   * @param allowCriterion - optional predicate; when provided, a criterion is
+   *   included only when the predicate returns true. Criteria that are rejected
+   *   are silently skipped (callers should log an anomaly separately).
    */
-  addRemediationSlices(criteria: Array<{ id: string; title: string; acceptanceCriteria: string[] }>): SliceQueue {
+  addRemediationSlices(
+    criteria: Array<{ id: string; title: string; acceptanceCriteria: string[] }>,
+    allowCriterion?: (ac: string) => boolean,
+  ): SliceQueue {
     const existingPhaseNums = this._slices
       .map((s) => {
         const m = s.phaseDir.match(/phase-(\d+)$/);
@@ -242,16 +268,21 @@ export class SliceQueue {
       .filter((n) => !isNaN(n));
     let nextPhase = (existingPhaseNums.length > 0 ? Math.max(...existingPhaseNums) : 0) + 1;
 
-    const newSlices: Slice[] = criteria.map((c) => ({
-      id: c.id,
-      title: c.title,
-      deps: [],
-      status: "ready",
-      requeueCount: 0,
-      acceptanceCriteria: c.acceptanceCriteria,
-      phaseDir: `phases/phase-${String(nextPhase++).padStart(2, "0")}`,
-      source: "remediation" as const,
-    }));
+    const newSlices: Slice[] = criteria
+      .map((c): Slice => {
+        const filteredCriteria = allowCriterion ? c.acceptanceCriteria.filter(allowCriterion) : c.acceptanceCriteria;
+        return {
+          id: c.id,
+          title: c.title,
+          deps: [],
+          status: "ready" as const,
+          requeueCount: 0,
+          acceptanceCriteria: filteredCriteria,
+          phaseDir: `phases/phase-${String(nextPhase++).padStart(2, "0")}`,
+          source: "remediation" as const,
+        };
+      })
+      .filter((s) => s.acceptanceCriteria.length > 0);
 
     return new SliceQueue([...this._slices, ...newSlices]);
   }
@@ -263,19 +294,27 @@ export class SliceQueue {
    *   acceptance_criteria:
    *     - criterion 1
    *     - criterion 2
+   *
+   * @param allowCriterion - optional predicate to filter individual criteria.
    */
-  addRemediationSlicesFromMarkdown(block: string): SliceQueue {
-    return this.addRemediationSlices(parseRemediationEntriesFromMarkdown(block));
+  addRemediationSlicesFromMarkdown(block: string, allowCriterion?: (ac: string) => boolean): SliceQueue {
+    return this.addRemediationSlices(parseRemediationEntriesFromMarkdown(block), allowCriterion);
   }
 
   /**
    * Like `addRemediationSlicesFromMarkdown` but first attempts to reopen existing
    * done/escalated slices that already own the failing criteria, appending fresh
    * R-NNN entries only for genuinely uncovered criteria.
+   *
+   * @param allowCriterion - optional predicate to filter individual criteria before
+   *   either reopening or appending new slices. Filtered-out criteria are dropped.
    */
-  applyRemediationFromMarkdown(block: string): { queue: SliceQueue; reopened: string[]; added: string[] } {
+  applyRemediationFromMarkdown(
+    block: string,
+    allowCriterion?: (ac: string) => boolean,
+  ): { queue: SliceQueue; reopened: string[]; added: string[]; dropped: string[] } {
     const entries = parseRemediationEntriesFromMarkdown(block);
-    return this.applyRemediationWithReopen(entries);
+    return this.applyRemediationWithReopen(entries, allowCriterion);
   }
 
   /**
@@ -400,25 +439,40 @@ function parseOptionalField(body: string, key: string): string | undefined {
 function applyRemediationWithReopenHelper(
   queue: SliceQueue,
   proposedEntries: Array<{ id: string; title: string; acceptanceCriteria: string[] }>,
-): { queue: SliceQueue; reopened: string[]; added: string[] } {
+  allowCriterion?: (ac: string) => boolean,
+): { queue: SliceQueue; reopened: string[]; added: string[]; dropped: string[] } {
   let current = queue;
   const reopened: string[] = [];
   const toAdd: Array<{ id: string; title: string; acceptanceCriteria: string[] }> = [];
+  const dropped: string[] = [];
 
   for (const entry of proposedEntries) {
+    // Filter criteria through the allowCriterion predicate before attempting reopen/append.
+    const filteredCriteria = allowCriterion
+      ? entry.acceptanceCriteria.filter((ac) => {
+          const ok = allowCriterion(ac);
+          if (!ok) dropped.push(ac);
+          return ok;
+        })
+      : entry.acceptanceCriteria;
+
+    if (filteredCriteria.length === 0) continue;
+
+    const filteredEntry = { ...entry, acceptanceCriteria: filteredCriteria };
+
     // Find an existing slice that owns every criterion in this entry.
-    const ownedBy = entry.acceptanceCriteria.every((ac) => current.findSliceOwningCriterion(ac) !== undefined)
-      ? current.findSliceOwningCriterion(entry.acceptanceCriteria[0] ?? "")
+    const ownedBy = filteredEntry.acceptanceCriteria.every((ac) => current.findSliceOwningCriterion(ac) !== undefined)
+      ? current.findSliceOwningCriterion(filteredEntry.acceptanceCriteria[0] ?? "")
       : undefined;
 
     if (ownedBy) {
       current = current.reopen(
         ownedBy.id,
-        `Reopened: downstream stage proved criterion still fails. Proposed remediation: ${entry.title}`,
+        `Reopened: downstream stage proved criterion still fails. Proposed remediation: ${filteredEntry.title}`,
       );
       reopened.push(ownedBy.id);
     } else {
-      toAdd.push(entry);
+      toAdd.push(filteredEntry);
     }
   }
 
@@ -427,7 +481,7 @@ function applyRemediationWithReopenHelper(
   }
 
   const added = toAdd.map((e) => e.id);
-  return { queue: current, reopened, added };
+  return { queue: current, reopened, added, dropped };
 }
 
 // ---------------------------------------------------------------------------
