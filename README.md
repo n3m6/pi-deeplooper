@@ -1,4 +1,4 @@
-# THIS IS TERRIBLE. DON'T RUN THIS (ARCHIVED PROJEDCT)
+# THIS IS TERRIBLE. DON'T RUN THIS (ARCHIVED PROJECT)
 ## pi-deeplooper
 
 `pi-deeplooper` is a deterministic TypeScript extension for [pi](https://github.com/mariozechner/pi-coding-agent). It runs the DEEPLOOPER pipeline in code while still reusing the bundled markdown leaf prompts for specialized synthesis, review, and reporting work.
